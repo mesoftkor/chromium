@@ -15,6 +15,11 @@ namespace content {
 
 namespace {
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+// CGDisplayStream remains the compatibility path until this capture device is
+// migrated to ScreenCaptureKit. Limit the warning exception to this class.
 class DesktopCaptureDeviceMac : public IOSurfaceCaptureDeviceBase {
  public:
   DesktopCaptureDeviceMac(CGDirectDisplayID display_id)
@@ -141,6 +146,8 @@ class DesktopCaptureDeviceMac : public IOSurfaceCaptureDeviceBase {
   media::VideoCaptureFormat requested_format_;
   base::WeakPtrFactory<DesktopCaptureDeviceMac> weak_factory_;
 };
+
+#pragma clang diagnostic pop
 
 }  // namespace
 
