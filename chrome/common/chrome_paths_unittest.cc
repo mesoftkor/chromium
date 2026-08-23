@@ -205,6 +205,17 @@ TEST(ChromePaths, DefaultUserDataDir) {
 }
 #endif
 
+#if BUILDFLAG(IS_MAC)
+TEST(ChromePaths, MewebDefaultUserDataDir) {
+  base::FilePath app_data_dir;
+  ASSERT_TRUE(base::PathService::Get(base::DIR_APP_DATA, &app_data_dir));
+
+  base::FilePath user_data_dir;
+  ASSERT_TRUE(GetDefaultUserDataDirectory(&user_data_dir));
+  EXPECT_EQ(app_data_dir.Append("MEWEB"), user_data_dir);
+}
+#endif
+
 #if BUILDFLAG(IS_CHROMEOS)
 TEST(ChromePaths, UserMediaDirectories) {
   base::FilePath path;
