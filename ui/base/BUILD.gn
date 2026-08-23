@@ -292,6 +292,8 @@ component("base") {
   }
 
   if (is_mac) {
+    cflags = [ "-Wno-deprecated-declarations" ]
+
     sources += [
       "cocoa/accessibility_focus_overrider.h",
       "cocoa/accessibility_focus_overrider.mm",

@@ -18,6 +18,8 @@ component("snapshot") {
   }
 
   if (is_mac) {
+    cflags = [ "-Wno-deprecated-declarations" ]
+
     sources += [
       "snapshot_mac.h",
       "snapshot_mac.mm",
