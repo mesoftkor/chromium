@@ -5,6 +5,10 @@
 assert(is_apple)
 
 source_set("mac") {
+  # AVCaptureDeviceTypeExternalUnknown remains the compatibility fallback for
+  # systems older than macOS 14, where its replacement is unavailable.
+  cflags = [ "-Wno-deprecated-declarations" ]
+
   # Note: This source_set is depended on only by //media. In the component
   # build, if other component targets also depend on it, multiple copies of
   # the ObjC classes declared in the files below will cause warnings at
