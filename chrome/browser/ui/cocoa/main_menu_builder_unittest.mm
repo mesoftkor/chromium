@@ -6,6 +6,7 @@
 
 #include "base/strings/utf_string_conversions.h"
 #include "chrome/app/chrome_command_ids.h"
+#include "chrome/grit/branded_strings.h"
 #include "chrome/grit/generated_resources.h"
 #include "testing/gtest/include/gtest/gtest.h"
 #include "testing/gtest_mac.h"
@@ -97,6 +98,15 @@ TEST(MainMenuBuilderTest, StringIdWithArg) {
 
   EXPECT_NSEQ(l10n_util::GetNSStringF(IDS_ABOUT_MAC, product_name),
               [item title]);
+}
+
+TEST(MainMenuBuilderTest, MewebProductIdentity) {
+  std::u16string product_name = l10n_util::GetStringUTF16(IDS_PRODUCT_NAME);
+  EXPECT_EQ(u"MEWEB", product_name);
+
+  NSMenuItem* about_item =
+      MenuItemBuilder(IDS_ABOUT_MAC).string_format_1(product_name).Build();
+  EXPECT_TRUE([[about_item title] containsString:@"MEWEB"]);
 }
 
 TEST(MainMenuBuilderTest, Disabled) {

@@ -294,10 +294,10 @@ If you update this file, be sure also to update google_chrome_strings.grd. -->
         </then>
         <else>
           <message name="IDS_PRODUCT_NAME" desc="The Chrome application name" translateable="false">
-            Chromium
+            MEWEB
           </message>
           <message name="IDS_SHORT_PRODUCT_NAME" desc="The Chrome application short name." translateable="false">
-            Chromium
+            MEWEB
           </message>
         </else>
       </if>
@@ -317,7 +317,7 @@ If you update this file, be sure also to update google_chrome_strings.grd. -->
       </if>
       <if expr="is_macosx or is_linux">
         <message name="IDS_FIRST_RUN_DIALOG_WINDOW_TITLE" desc="Window title of First Run dialog on Mac and Linux, displayed in title bar">
-          Welcome to Chromium
+          Welcome to MEWEB
         </message>
       </if>
       <if expr="is_linux">
@@ -449,7 +449,7 @@ New bookmarks can’t be saved in your account until you delete some. If you sig
           </then>
           <else>
             <message name="IDS_BROWSER_WINDOW_TITLE_FORMAT" desc="The format for titles displayed in tabs and popup windows">
-              <ph name="PAGE_TITLE">$1<ex>Google</ex></ph> - Chromium
+              <ph name="PAGE_TITLE">$1<ex>Google</ex></ph> - MEWEB
             </message>
           </else>
         </if>
@@ -457,7 +457,7 @@ New bookmarks can’t be saved in your account until you delete some. If you sig
       <if expr="is_chromeos">
         <!-- Browser Window Title Format -->
         <message name="IDS_BROWSER_WINDOW_TITLE_FORMAT" desc="The format for titles displayed in tabbed browser windows">
-          Chromium - <ph name="PAGE_TITLE">$1<ex>Google</ex></ph>
+          MEWEB - <ph name="PAGE_TITLE">$1<ex>Google</ex></ph>
         </message>
       </if>
       <if expr="not is_chromeos and not is_macosx">
@@ -488,7 +488,7 @@ New bookmarks can’t be saved in your account until you delete some. If you sig
         </then>
         <else>
           <message name="IDS_ACCESSIBLE_BROWSER_WINDOW_TITLE_FORMAT" desc="The format for the accessible name of a tabbed browser window">
-            <ph name="PAGE_TITLE">$1<ex>Google</ex></ph> - Chromium
+            <ph name="PAGE_TITLE">$1<ex>Google</ex></ph> - MEWEB
           </message>
         </else>
       </if>
@@ -512,10 +512,10 @@ New bookmarks can’t be saved in your account until you delete some. If you sig
         </then>
         <else>
           <message name="IDS_ABOUT_VERSION_COMPANY_NAME" desc="Company name on the about pages">
-            The Chromium Authors
+            MESOFT
           </message>
           <message name="IDS_ABOUT_VERSION_COPYRIGHT" desc="Copyright information on the about pages">
-            Copyright <ph name="YEAR">{0,date,y}<ex>2016</ex></ph> The Chromium Authors. All rights reserved.
+            Copyright <ph name="YEAR">{0,date,y}<ex>2026</ex></ph> MESOFT. All rights reserved.
           </message>
         </else>
       </if>
@@ -544,7 +544,7 @@ New bookmarks can’t be saved in your account until you delete some. If you sig
       </if>
       <if expr="is_macosx">
         <message name="IDS_MACOS_OBSOLETE" desc="A message displayed on an at-launch infobar and About (Help) page warning the user that the OS version they are using will soon be or is already unsupported.">
-          To get future Chromium updates, you'll need macOS 13 or later. This computer is using macOS 12.
+          To get future MEWEB updates, you'll need macOS 13 or later. This computer is using macOS 12.
         </message>
       </if>
       <if expr="is_win">
@@ -573,7 +573,7 @@ New bookmarks can’t be saved in your account until you delete some. If you sig
         </message>
       </if>
       <message name="IDS_ACCNAME_APP" desc="The accessible name for the app menu." translateable="false">
-        Chromium
+        MEWEB
       </message>
       <!-- Hung Browser Detector -->
       <if expr="is_win">
@@ -584,7 +584,7 @@ New bookmarks can’t be saved in your account until you delete some. If you sig
       <!-- General app failure messages -->
       <if expr="not is_chromeos and not is_android">
         <message name="IDS_COULDNT_STARTUP_PROFILE_ERROR" desc="Error displayed when Chrome cannot start because profiles were not opened correctly.">
-          Cannot start Chromium because something went wrong when opening your profile. Try to restart Chromium.
+          Cannot start MEWEB because something went wrong when opening your profile. Try to restart MEWEB.
         </message>
       </if>
       <!-- Sharing messages -->
@@ -605,10 +605,10 @@ New bookmarks can’t be saved in your account until you delete some. If you sig
       </if>
       <!-- Default Browser messages -->
       <message name="IDS_FR_CUSTOMIZE_DEFAULT_BROWSER" desc="Default browser checkbox label">
-        Make Chromium the default browser
+        Make MEWEB the default browser
       </message>
       <message name="IDS_DEFAULT_BROWSER_CHANGED_MESSAGE" desc="Body of the notification shown when Chrome is no longer the default browser.">
-        Chromium is no longer your default browser. Make Chromium the default browser?
+        MEWEB is no longer your default browser. Make MEWEB the default browser?
       </message>
       <if expr="is_win">
         <message name="IDS_DEFAULT_BROWSER_VISUAL_GUIDED_SETTER_PAGE_TITLE" desc="Title of the default browser visual guided setter page.">
@@ -697,7 +697,7 @@ Chromium is unable to recover your settings.
       </message>
       <if expr="is_macosx">
       <message name="IDS_PASSWORDS_AUTHENTICATION_PROMPT_PREFIX" desc="Text shown in the beginning of the OS-level user authentication prompt before performing a seneitive operation such as show passwords in plain text.">
-          Chromium is trying to <ph name="AUTHENTICATION_PURPOSE">$1<ex>show passwords</ex></ph>
+          MEWEB is trying to <ph name="AUTHENTICATION_PURPOSE">$1<ex>show passwords</ex></ph>
         </message>
       </if>
       <if expr="is_win">
@@ -763,10 +763,10 @@ Chromium is unable to recover your settings.
       </if>
       <if expr="not is_android">
         <message name="IDS_PASSWORD_MANAGER_IMPORT_DIALOG_TITLE" desc="The title of the file selection dialog for importing passwords">
-          Import Passwords To Chromium
+          Import Passwords To MEWEB
         </message>
         <message name="IDS_PASSWORD_MANAGER_EXPORT_DIALOG_TITLE" desc="The title of the file selection dialog for exporting passwords">
-          Export Passwords From Chromium
+          Export Passwords From MEWEB
         </message>
       </if>
       <!-- Options Dialog -->
@@ -789,45 +789,45 @@ Chromium is unable to recover your settings.
       </if>
       <if expr="is_macosx">
         <message name="IDS_PIN_INFOBAR_DOCK_TEXT" desc="Text to show in an infobar when Chromium is not in the Dock.">
-          Keep Chromium in your Dock to get to it quickly anytime
+          Keep MEWEB in your Dock to get to it quickly anytime
         </message>
         <message name="IDS_PIN_INFOBAR_DOCK_BUTTON" desc="Label for the button on an infobar offering to keep Chromium in the Dock.">
           Keep in Dock
         </message>
       </if>
       <message name="IDS_DEFAULT_BROWSER_INFOBAR_TEXT" desc="Text to show in an infobar when Chromium is not the current default browser.">
-        Chromium isn't your default browser
+        MEWEB isn't your default browser
       </message>
       <message name="IDS_DEFAULT_BROWSER_PIN_INFOBAR_TEXT" desc="Text to show in an infobar when Chromium is not the current default browser and can be pinned to the taskbar.">
-        Set Chromium as your default browser and pin it to your taskbar
+        Set MEWEB as your default browser and pin it to your taskbar
       </message>
       <if expr="not is_android and not is_chromeos">
         <message name="IDS_DEFAULT_BROWSER_MODAL_TITLE_WITH_SETTINGS_ILLUSTRATION" desc="Title of the default browser modal with settings illustration.">
-          Set Chromium as your default browser
+          Set MEWEB as your default browser
         </message>
         <message name="IDS_DEFAULT_BROWSER_MODAL_BODY_WITH_SETTINGS_ILLUSTRATION" desc="Body text of the default browser modal with settings illustration.">
-          Keep your passwords, bookmarks, and history perfectly synced across devices. Easily access the features you know and love by updating your default browser to Chromium.
+          Keep your passwords, bookmarks, and history perfectly synced across devices. Easily access the features you know and love by updating your default browser to MEWEB.
         </message>
         <message name="IDS_DEFAULT_BROWSER_MODAL_BODY_WITH_SETTINGS_ILLUSTRATION_UNPINNED" desc="Body text of the default browser modal with settings illustration when Chromium is not pinned to the taskbar.">
-          Keep your passwords, bookmarks, and history perfectly synced across devices. Easily access the features you know and love by updating your default browser to Chromium. Chromium will be pinned to your taskbar for quick access.
+          Keep your passwords, bookmarks, and history perfectly synced across devices. Easily access the features you know and love by updating your default browser to MEWEB. MEWEB will be pinned to your taskbar for quick access.
         </message>
         <message name="IDS_DEFAULT_BROWSER_MODAL_TITLE_WITHOUT_SETTINGS_ILLUSTRATION" desc="Title of the default browser modal without settings illustration.">
-          Set Chromium as your default browser
+          Set MEWEB as your default browser
         </message>
         <message name="IDS_DEFAULT_BROWSER_MODAL_BODY_WITHOUT_SETTINGS_ILLUSTRATION" desc="Body text of the default browser modal without settings illustration.">
-          Get easy access to the features you know, love, and trust by setting Chromium as your default browser.
+          Get easy access to the features you know, love, and trust by setting MEWEB as your default browser.
         </message>
         <message name="IDS_DEFAULT_BROWSER_MODAL_BODY_WITHOUT_SETTINGS_ILLUSTRATION_UNPINNED" desc="Body text of the default browser modal without settings illustration when Chromium is not pinned to the taskbar.">
-          Get easy access to the features you know, love, and trust by setting Chromium as your default browser. Chromium will be pinned to your taskbar for quick access.
+          Get easy access to the features you know, love, and trust by setting MEWEB as your default browser. MEWEB will be pinned to your taskbar for quick access.
         </message>
         <message name="IDS_DEFAULT_BROWSER_BUBBLE_DIALOG_TITLE" desc="Title of the dialog prompting the user to set Chromium as the default browser.">
-          Set Chromium as your default browser
+          Set MEWEB as your default browser
         </message>
         <message name="IDS_DEFAULT_BROWSER_BUBBLE_DIALOG_BODY" desc="Main explanatory text in the default browser dialog.">
-          Get easy access to the features you know, love, and trust by setting Chromium as your default browser.
+          Get easy access to the features you know, love, and trust by setting MEWEB as your default browser.
         </message>
         <message name="IDS_DEFAULT_BROWSER_SUCCESS_TOAST_BODY" desc="Body text of the toast shown when Chromium is successfully set as the default browser.">
-          Chromium is now your default browser
+          MEWEB is now your default browser
         </message>
         <message name="IDS_DEFAULT_BROWSER_BUBBLE_DIALOG_STEPS_PINNED_COMBINED" desc="Numbered instructions. $1, $2 and $3 are the bold button names.">
           1. Click <ph name="BUTTON_LABEL">$1<ex>Open settings</ex></ph> below&#xA;2. Click <ph name="BUTTON_2">$2<ex>Set default</ex></ph> in your Windows settings&#xA;3. Click <ph name="BUTTON_3">$3<ex>Yes</ex></ph> in the Windows notification to pin Chromium to your taskbar for quick access
@@ -835,7 +835,7 @@ Chromium is unable to recover your settings.
       </if>
       <if expr="is_win or is_macosx">
         <message name="IDS_PDF_INFOBAR_TEXT" desc="Text to show in an infobar when Chromium is not the default PDF viewer.">
-          Set Chromium as your default PDF viewer
+          Set MEWEB as your default PDF viewer
         </message>
       </if>
       <if expr="enable_pdf">
