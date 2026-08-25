@@ -213,12 +213,12 @@ def _TagSuffixes():
   return tag_suffixes
 
 
-def _AddKeystoneKeys(plist, bundle_identifier, base_tag):
+def _AddKeystoneKeys(plist, bundle_identifier, base_tag, update_url):
   """Adds the Keystone keys. This must be called AFTER _AddVersionKeys() and
   also requires the |bundle_identifier| argument (com.example.product)."""
   plist['KSVersion'] = plist['CFBundleShortVersionString']
   plist['KSProductID'] = bundle_identifier
-  plist['KSUpdateURL'] = 'https://tools.google.com/service/update2'
+  plist['KSUpdateURL'] = update_url
 
   _RemoveKeys(plist, 'KSChannelID')
   if base_tag != '':
@@ -333,6 +333,9 @@ def Main(argv):
   parser.add_option('--keystone-base-tag',
                     default='',
                     help='Base Keystone tag to set')
+  parser.add_option('--keystone-update-url',
+                    default='https://tools.google.com/service/update2',
+                    help='Keystone update service URL')
   parser.add_option('--scm',
                     dest='add_scm_info',
                     action='store',
@@ -464,7 +467,7 @@ def Main(argv):
       print(f'Invalid bundle id: {options.bundle_identifier}', file=sys.stderr)
       return 1
     _AddKeystoneKeys(plist, options.bundle_identifier,
-                     options.keystone_base_tag)
+                     options.keystone_base_tag, options.keystone_update_url)
   else:
     _RemoveKeystoneKeys(plist)
 

@@ -509,14 +509,15 @@ if (is_win) {
       "--bundle_id=$chrome_mac_bundle_id",
     ]
     if (enable_updater) {
-      args += [ "--privileged_helper_id=$privileged_helper_name" ]
+      args += [
+        "--keystone=1",
+        "--keystone-update-url=$update_check_url",
+        "--privileged_helper_id=$privileged_helper_name",
+      ]
       if (is_chrome_branded) {
-        args += [ "--keystone=1" ]
         if (current_cpu == "arm64") {
           args += [ "--keystone-base-tag=arm64" ]
         }
-      } else {
-        args += [ "--keystone=0" ]
       }
     } else {
       args += [ "--keystone=0" ]

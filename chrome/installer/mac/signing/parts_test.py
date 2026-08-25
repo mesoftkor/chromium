@@ -329,11 +329,19 @@ class TestSignChrome(unittest.TestCase):
 
         config = model.Distribution().to_config(Config())
         asyncio.run(parts.sign_chrome(self.paths, config, sign_framework=True))
-        # Ensure that the privileged helper is signed.
-        self.assertIn(
-            'App Product.app/Contents/Library/LaunchServices' +
-            '/test.signing.bundle_id.UpdaterPrivilegedHelper',
-            [call[1][2].path for call in kwargs['sign_part'].mock_calls])
+        # Ensure that the updater's nested code and privileged helper are
+        # signed before the containing framework and app.
+        signed_paths = [
+            call[1][2].path for call in kwargs['sign_part'].mock_calls
+        ]
+        for expected in (
+                'App Product.app/Contents/Frameworks/Product Framework.framework/Helpers/ProductUpdater.app/Contents/Helpers/ProductSoftwareUpdate.bundle/Contents/Helpers/ksadmin',
+                'App Product.app/Contents/Frameworks/Product Framework.framework/Helpers/ProductUpdater.app/Contents/Helpers/ProductSoftwareUpdate.bundle/Contents/Helpers/ksinstall',
+                'App Product.app/Contents/Frameworks/Product Framework.framework/Helpers/ProductUpdater.app/Contents/Helpers/ProductSoftwareUpdate.bundle',
+                'App Product.app/Contents/Frameworks/Product Framework.framework/Helpers/ProductUpdater.app/Contents/Helpers/launcher',
+                'App Product.app/Contents/Frameworks/Product Framework.framework/Helpers/ProductUpdater.app',
+                'App Product.app/Contents/Library/LaunchServices/test.signing.bundle_id.UpdaterPrivilegedHelper'):
+            self.assertIn(expected, signed_paths)
 
     @mock.patch('signing.parts._sanity_check_version_keys')
     def test_sign_chrome_no_updater(self, *args, **kwargs):

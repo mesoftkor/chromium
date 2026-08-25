@@ -262,7 +262,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     const crumbs = {
       start: '<b>시작 화면</b> · 검색, 바로가기와 진행 중인 작업',
       work: `<b>${esc(state.task.name)}</b> · 승인 기반 에이전트 워크스페이스`,
-      settings: `<b>환경설정</b> · ${esc({appearance:'모양', search:'검색엔진', startup:'시작 화면', agent:'에이전트', privacy:'개인정보 보호', downloads:'다운로드'}[settingsSection])}`,
+      settings: `<b>환경설정</b> · ${esc({appearance:'모양', search:'검색엔진', startup:'시작 화면', agent:'에이전트', privacy:'개인정보 보호', downloads:'다운로드', updates:'업데이트·복구'}[settingsSection])}`,
     };
     setHtml($('#crumb'), crumbs[currentView]);
     $('#auditPanel').hidden = !auditOpen || currentView !== 'work';
@@ -363,6 +363,21 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
           ${row('시간대 미리보기', '', `<div class="setting-control"><input type="range" id="hourInput" min="0" max="3" value="${state.adaptive.hour}"><span class="value" id="hourValue">${HOURS[state.adaptive.hour]}</span></div>`)}
           <div class="setting-row"><div class="list">${patterns.map(pattern => `<div class="list-row"><span class="label">${HOURS[pattern.hour]} · ${esc(pattern.task)}</span><button class="delete" data-forget-pattern="${pattern.id}">×</button></div>`).join('') || '<span class="lede">학습된 패턴이 없습니다.</span>'}</div></div>
           ${row('학습 기록', '', '<button class="btn danger" id="forgetAllButton">모두 지우기</button>')}
+        </section>`);
+    } else if (settingsSection === 'updates') {
+      setHtml(content, `<h1>업데이트·복구</h1><p class="lede">MEWEB는 새 버전을 서명과 해시로 확인한 뒤 설치합니다.</p>
+        <section class="settings-card"><h2>업데이트</h2>
+          ${row('업데이트 확인', '다운로드가 중단됐다면 다시 확인하면 처음부터 안전하게 재시도합니다.', '<button class="btn primary" id="openUpdateSettingsButton">업데이트 확인 열기</button>')}
+          ${row('설치 보호', '손상됐거나 서명이 다른 업데이트는 설치하지 않으며 현재 버전을 유지합니다.', '<span class="value">사용 중</span>')}
+          ${row('복구 사본', '설치 직전 버전은 검증이 끝날 때까지 롤백 사본으로 유지합니다.', '<span class="value">자동</span>')}
+        </section>
+        <section class="settings-card"><h2>비정상 종료 복구</h2>
+          <div class="setting-row"><div class="note">브라우저가 비정상 종료되면 다음 실행에서 <b>복원</b>을 선택해 이전 창과 탭을 되살릴 수 있습니다.</div></div>
+        </section>
+        <section class="settings-card"><h2>진단 안내</h2>
+          ${row('업데이터 로그', '확인·다운로드 오류와 재시도 기록', '<code>~/Library/Application Support/MESOFT/MEWEBUpdater/updater.log</code>')}
+          ${row('설치 로그', '설치·검증·롤백 결과와 MEWEB-U 오류 코드', '<code>~/Library/Logs/MEWEB/updater-install.jsonl</code>')}
+          <div class="setting-row"><div class="note"><b>MEWEB-U100~U106</b>: 업데이트 파일 또는 대상 오류<br><b>MEWEB-U107~U110</b>: 서명·버전·설치 검증 오류<br><b>MEWEB-U111~U115</b>: 설치 또는 롤백 오류<br>오류가 반복되면 위 로그와 표시된 코드를 함께 전달하세요.</div></div>
         </section>`);
     } else {
       const title = settingsSection === 'privacy' ? '개인정보 보호' : '다운로드';
@@ -540,6 +555,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       case 'forgetAllButton': state.adaptive.forgotten = PATTERNS.map(pattern => pattern.id); save(); renderAll(); toast('학습 기록을 모두 지웠습니다.'); break;
       case 'addWorkflowButton': addWorkflow(); break;
       case 'openChromeSettingsButton': window.location.assign('chrome://settings/'); break;
+      case 'openUpdateSettingsButton': window.location.assign('chrome://settings/help'); break;
     }
   });
 

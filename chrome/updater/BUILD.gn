@@ -512,13 +512,19 @@ if (is_win || is_mac || is_linux) {
   source_set("constants_prod") {
     sources = [
       "constants_prod.cc",
-      "external_constants_prod.cc",
+      "external_constants_override.cc",
+      "external_constants_override.h",
     ]
 
     deps = [
+      ":branding_header",
       ":constants_header",
       ":external_constants",
+      ":public_sources",
+      ":version_header",
       "//base",
+      "//components/crx_file",
+      "//url",
     ]
   }
 

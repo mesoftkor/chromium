@@ -48,7 +48,15 @@ class DefaultExternalConstants : public ExternalConstants {
     return GURL(UPDATER_EVENT_LOGGING_URL);
   }
 
-  bool UseCUP() const override { return true; }
+  bool UseCUP() const override {
+#if BUILDFLAG(GOOGLE_CHROME_BRANDING)
+    return true;
+#else
+    // MEWEB's update service is isolated from Google's CUP infrastructure.
+    // Transport security and the signed update package protect this channel.
+    return false;
+#endif
+  }
 
   base::TimeDelta InitialDelay() const override { return kInitialDelay; }
 
@@ -57,7 +65,13 @@ class DefaultExternalConstants : public ExternalConstants {
   }
 
   crx_file::VerifierFormat CrxVerifierFormat() const override {
+#if BUILDFLAG(GOOGLE_CHROME_BRANDING)
     return crx_file::VerifierFormat::CRX3_WITH_PUBLISHER_PROOF;
+#else
+    // Publisher proofs are issued for Google's production updater only.
+    // MEWEB still requires a valid CRX3 signature and the response SHA-256.
+    return crx_file::VerifierFormat::CRX3;
+#endif
   }
 
   std::optional<std::vector<uint8_t>> CrxPublicKeyHash() const override {

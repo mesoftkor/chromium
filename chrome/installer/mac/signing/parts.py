@@ -114,6 +114,36 @@ def get_parts(config):
     }
 
     if config.enable_updater:
+        updater_root = (
+            '{0.framework_dir}/Helpers/{0.product}Updater.app').format(config)
+        updater_keystone = (
+            updater_root + '/Contents/Helpers/' +
+            config.product + 'SoftwareUpdate.bundle')
+        parts['updater-ksadmin'] = CodeSignedProduct(
+            updater_keystone + '/Contents/Helpers/ksadmin',
+            'ksadmin',
+            options=CodeSignOptions.FULL_HARDENED_RUNTIME_OPTIONS,
+            verify_options=verify_options)
+        parts['updater-ksinstall'] = CodeSignedProduct(
+            updater_keystone + '/Contents/Helpers/ksinstall',
+            'ksinstall',
+            options=CodeSignOptions.FULL_HARDENED_RUNTIME_OPTIONS,
+            verify_options=verify_options)
+        parts['updater-keystone-bundle'] = CodeSignedProduct(
+            updater_keystone,
+            '{}.Keystone'.format(uncustomized_bundle_id),
+            options=CodeSignOptions.FULL_HARDENED_RUNTIME_OPTIONS,
+            verify_options=verify_options)
+        parts['updater-launcher'] = CodeSignedProduct(
+            updater_root + '/Contents/Helpers/launcher',
+            'MEWEBUpdaterLauncher',
+            options=CodeSignOptions.FULL_HARDENED_RUNTIME_OPTIONS,
+            verify_options=verify_options)
+        parts['updater-app'] = CodeSignedProduct(
+            updater_root,
+            '{}.updater'.format(uncustomized_bundle_id),
+            options=CodeSignOptions.FULL_HARDENED_RUNTIME_OPTIONS,
+            verify_options=verify_options)
         parts['privileged-helper'] = CodeSignedProduct(
             ('{.app_product}.app/Contents/Library/LaunchServices/' +
              '{}.UpdaterPrivilegedHelper').format(config,
