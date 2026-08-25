@@ -96,7 +96,7 @@ class VerticalTabStripStateControllerTest : public testing::Test {
 };
 
 TEST_F(VerticalTabStripStateControllerTest, Initial) {
-  EXPECT_FALSE(controller()->ShouldDisplayVerticalTabs());
+  EXPECT_TRUE(controller()->ShouldDisplayVerticalTabs());
   EXPECT_FALSE(controller()->IsCollapsed());
   EXPECT_EQ(kVerticalTabStripDefaultUncollapsedWidth,
             controller()->GetUncollapsedWidth());
@@ -140,6 +140,7 @@ TEST_F(VerticalTabStripStateControllerTest, FeatureDisabled) {
 
 TEST_F(VerticalTabStripStateControllerTest, VerticalTabsEnabledFirstTime) {
   base::UserActionTester user_action_tester;
+  controller()->SetVerticalTabsEnabled(false);
   ASSERT_FALSE(
       pref_service()->GetBoolean(prefs::kVerticalTabsEnabledFirstTime));
   ASSERT_EQ(0,
@@ -275,6 +276,7 @@ TEST_F(VerticalTabStripStateControllerTest, ExpandOnHoverEnabledChanged) {
 }
 
 TEST_F(VerticalTabStripStateControllerTest, ImmersiveModeLock) {
+  controller()->SetVerticalTabsEnabled(false);
   int call_count = 0;
   auto subscription = controller()->RegisterOnModeChanged(base::BindRepeating(
       [](int* call_count, VerticalTabStripStateController* controller) {
@@ -339,6 +341,7 @@ TEST_F(VerticalTabStripStateControllerTest, VerifyRecentlyUsedPrefs) {
 
 TEST_F(VerticalTabStripStateControllerTest,
        ImmersiveModeLockShowsToastWhenEnabling) {
+  controller()->SetVerticalTabsEnabled(false);
   MockToastController mock_toast_controller(&mock_browser_window_interface_);
 
   // Initially disabled.

@@ -12,7 +12,10 @@
 #include <vector>
 
 #include "base/command_line.h"
+#include "base/functional/bind.h"
+#include "base/json/json_reader.h"
 #include "base/logging.h"
+#include "base/memory/raw_ptr.h"
 #include "base/metrics/histogram_functions.h"
 #include "base/notreached.h"
 #include "base/strings/strcat.h"
@@ -119,7 +122,9 @@
 #include "components/user_education/common/user_education_features.h"
 #include "content/public/browser/navigation_handle.h"
 #include "content/public/browser/url_data_source.h"
+#include "content/public/browser/web_ui.h"
 #include "content/public/browser/web_ui_data_source.h"
+#include "content/public/browser/web_ui_message_handler.h"
 #include "google_apis/gaia/core_account_id.h"
 #include "media/base/media_switches.h"
 #include "mojo/public/cpp/base/big_buffer.h"
@@ -190,12 +195,62 @@ NewTabPageUIConfig::CreateWebUIController(content::WebUI* web_ui,
 namespace {
 
 constexpr char kPrevNavigationTimePrefName[] = "NewTabPage.PrevNavigationTime";
+constexpr char kMewebAgentWorkspaceStatePref[] =
+    "meweb.agent_workspace_state";
+constexpr size_t kMaxMewebAgentWorkspaceStateBytes = 512 * 1024;
 // The value for the "udm" (Unified Drilldown Mode) query parameter.
 // value "50" triggers AI mode as opposed to traditional search.
 constexpr char kAIMDisplayMode[] = "50";
 // The value for the "atvm" (AIM Threads Visibility Mode) query parameter.
 // value "3" corresponds to Threads Visibility Mode "Always Open".
 constexpr char kAIMThreadsVisibilityMode[] = "3";
+
+class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
+ public:
+  explicit MewebAgentWorkspaceHandler(Profile* profile) : profile_(profile) {}
+
+  MewebAgentWorkspaceHandler(const MewebAgentWorkspaceHandler&) = delete;
+  MewebAgentWorkspaceHandler& operator=(const MewebAgentWorkspaceHandler&) =
+      delete;
+
+  void RegisterMessages() override {
+    web_ui()->RegisterMessageCallback(
+        "mewebAgentSaveState",
+        base::BindRepeating(&MewebAgentWorkspaceHandler::HandleSaveState,
+                            base::Unretained(this)));
+    web_ui()->RegisterMessageCallback(
+        "mewebAgentLoadState",
+        base::BindRepeating(&MewebAgentWorkspaceHandler::HandleLoadState,
+                            base::Unretained(this)));
+  }
+
+ private:
+  void HandleSaveState(const base::ListValue& args) {
+    if (args.size() == 1 && args[0].is_string()) {
+      const std::string& serialized = args[0].GetString();
+      if (serialized.size() <= kMaxMewebAgentWorkspaceStateBytes) {
+        auto parsed = base::JSONReader::Read(serialized, 0);
+        if (parsed && parsed->is_dict()) {
+          profile_->GetPrefs()->SetString(kMewebAgentWorkspaceStatePref,
+                                          serialized);
+        }
+      }
+    }
+  }
+
+  void HandleLoadState(const base::ListValue& args) {
+    if (!args.empty()) {
+      return;
+    }
+    AllowJavascript();
+    CallJavascriptFunction(
+        "mewebAgentWorkspaceLoadState",
+        base::Value(
+            profile_->GetPrefs()->GetString(kMewebAgentWorkspaceStatePref)));
+  }
+
+  raw_ptr<Profile> profile_;
+};
 
 bool HasCredentials(Profile* profile) {
   auto* identity_manager = IdentityManagerFactory::GetForProfile(profile);
@@ -833,6 +888,10 @@ content::WebUIDataSource* CreateAndAddNewTabPageUiHtmlSource(
 
   webui::SetupWebUIDataSource(source, kNewTabPageResources,
                               IDR_NEW_TAB_PAGE_NEW_TAB_PAGE_HTML);
+  source->OverrideContentSecurityPolicy(
+      network::mojom::CSPDirectiveName::TrustedTypes,
+      base::StrCat(
+          {webui::kDefaultTrustedTypesPolicies, " meweb-agent-workspace;"}));
 
 #if !BUILDFLAG(OPTIMIZE_WEBUI)
   source->AddResourcePaths(kNewTabSharedResources);
@@ -926,6 +985,8 @@ NewTabPageUI::NewTabPageUI(content::WebUI* web_ui)
 
   auto* source = CreateAndAddNewTabPageUiHtmlSource(
       profile_, session_allows_drag_and_drop);
+  web_ui->AddMessageHandler(
+      std::make_unique<MewebAgentWorkspaceHandler>(profile_));
 // TODO(b/502297163): Implement for Android.
 #if BUILDFLAG(IS_ANDROID)
   bool wallpaper_search_button_enabled = false;
@@ -1062,6 +1123,7 @@ bool NewTabPageUI::IsNewTabPageOrigin(const GURL& url) {
 // static
 void NewTabPageUI::RegisterProfilePrefs(PrefRegistrySimple* registry) {
   registry->RegisterTimePref(kPrevNavigationTimePrefName, base::Time());
+  registry->RegisterStringPref(kMewebAgentWorkspaceStatePref, std::string());
   registry->RegisterBooleanPref(ntp_prefs::kNtpCustomLinksVisible, true);
   registry->RegisterBooleanPref(ntp_prefs::kNtpEnterpriseShortcutsVisible,
                                 false);

@@ -29,7 +29,9 @@ void RegisterProfilePrefs(user_prefs::PrefRegistrySyncable* registry) {
           tabs::kMigrateEverythingMenuPinnedToTabstrip));
   registry->RegisterBooleanPref(
       prefs::kEverythingMenuPinnedToTabstripMigrationComplete, false);
-  registry->RegisterBooleanPref(prefs::kVerticalTabsEnabled, false);
+  // MEWEB uses the native vertical tab strip as the primary tab surface. A
+  // user can still switch back to horizontal tabs from the tab strip menu.
+  registry->RegisterBooleanPref(prefs::kVerticalTabsEnabled, true);
   registry->RegisterBooleanPref(
       prefs::kVerticalTabsExpandOnHoverEnabled,
       tabs::kVerticalTabsExpandOnHoverDefaultEnabled.Get());
