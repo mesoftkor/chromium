@@ -162,6 +162,52 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     },
   };
   const MODEL_PROFILE_IDS = Object.keys(MODEL_PROFILES);
+  const MODEL_AUTHENTICATION = {
+    openai: {
+      defaultMethod: 'oauth_wif',
+      methods: {
+        oauth_wif: {
+          label: 'OAuth 2.0 WIF', accountType: 'service_account',
+          interactive: false, brokerReference: 'meweb-oauth-broker://openai',
+        },
+        api_key: {
+          label: 'API 키', accountType: 'service_account',
+          interactive: false, brokerReference: 'OPENAI_API_KEY',
+        },
+      },
+    },
+    anthropic: {
+      defaultMethod: 'cli_oauth',
+      methods: {
+        cli_oauth: {
+          label: 'Anthropic 계정 OAuth', accountType: 'user',
+          interactive: true, brokerReference: 'anthropic-ant-cli://default',
+        },
+        oauth_wif: {
+          label: 'OAuth 2.0 WIF', accountType: 'service_account',
+          interactive: false, brokerReference: 'meweb-oauth-broker://anthropic',
+        },
+        api_key: {
+          label: 'API 키', accountType: 'service_account',
+          interactive: false, brokerReference: 'ANTHROPIC_API_KEY',
+        },
+      },
+    },
+    google: {
+      defaultMethod: 'api_key',
+      methods: {api_key: {
+        label: 'API 키', accountType: 'service_account',
+        interactive: false, brokerReference: 'GEMINI_API_KEY',
+      }},
+    },
+    local: {
+      defaultMethod: 'none',
+      methods: {none: {
+        label: '인증 없음', accountType: 'local',
+        interactive: false, brokerReference: null,
+      }},
+    },
+  };
   const MODEL_TOOL_CHOICES = ['required', 'auto', 'none'];
   const MODEL_SELECTOR_PROFILES = ['naver-desktop-v1', 'naver-mobile-v1'];
   const MODEL_FAIL_POLICIES = [
@@ -200,6 +246,8 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     const profile = MODEL_PROFILES[selected];
     return {
       selected,
+      authenticationMethod:
+          MODEL_AUTHENTICATION[profile.provider].defaultMethod,
       endpoint: profile.endpoint,
       temperature: profile.temperature,
       maxOutputTokens: profile.maxOutputTokens,
@@ -220,8 +268,12 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     const temperature = Number(source.temperature);
     const maxOutputTokens = Number(source.maxOutputTokens);
     const retryLimit = Number(source.retryLimit);
+    const authentication = MODEL_AUTHENTICATION[profile.provider];
     return {
       selected,
+      authenticationMethod:
+          authentication.methods[source.authenticationMethod] ?
+          source.authenticationMethod : authentication.defaultMethod,
       endpoint: profile.provider === 'local' &&
               isLoopbackEndpoint(source.endpoint) ?
           String(source.endpoint) : profile.endpoint,
@@ -257,6 +309,10 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     const profile = MODEL_PROFILES[candidate.selected];
     if (!profile) errors.push('지원하지 않는 모델 프로필입니다.');
     if (profile) {
+      const authentication = MODEL_AUTHENTICATION[profile.provider];
+      if (!authentication.methods[candidate.authenticationMethod]) {
+        errors.push('선택한 공급자에서 지원하지 않는 인증 방식입니다.');
+      }
       if (profile.provider === 'local') {
         if (!isLoopbackEndpoint(candidate.endpoint)) {
           errors.push('로컬 모델 주소는 localhost 또는 loopback만 허용합니다.');
@@ -296,6 +352,11 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
   function effectiveModelRuntime(candidate = state?.model) {
     const settings = sanitizeModelSettings(candidate);
     const profile = MODEL_PROFILES[settings.selected];
+    const authentication =
+        MODEL_AUTHENTICATION[profile.provider].methods[
+            settings.authenticationMethod];
+    const credentialReference = settings.authenticationMethod === 'api_key' ?
+        profile.credentialReference : authentication.brokerReference;
     return {
       schema_version: 'meweb-agent-model-runtime-v1',
       selected_model: {
@@ -308,7 +369,14 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
         max_output_tokens: settings.maxOutputTokens,
         tool_choice: settings.toolChoice,
         tool_format: profile.toolFormat,
-        credential_reference: profile.credentialReference,
+        credential_reference: credentialReference,
+        authentication: {
+          method: settings.authenticationMethod,
+          account_type: authentication.accountType,
+          interactive_login: authentication.interactive,
+          broker_reference: authentication.brokerReference,
+          token_persisted_by_meweb: false,
+        },
       },
       selected_selector_profile: settings.selectorProfile,
       runtime: {
@@ -322,6 +390,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       },
       security: {
         credentials_persisted: false,
+        oauth_access_tokens_memory_only: true,
         cloud_endpoints_locked: true,
         local_endpoint_loopback_only: true,
         publish_click_guard: true,
@@ -551,6 +620,21 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     } else if (settingsSection === 'models') {
       const selectedProfile = modelProfile();
       const endpointEditable = selectedProfile.provider === 'local';
+      const authentication = MODEL_AUTHENTICATION[selectedProfile.provider];
+      const authenticationMethod =
+          authentication.methods[state.model.authenticationMethod];
+      const authenticationOptions = Object.entries(authentication.methods)
+          .map(([id, definition]) => [id, id, definition.label]);
+      let authenticationHelp = '이 모델은 별도 로그인이 필요하지 않습니다.';
+      if (state.model.authenticationMethod === 'oauth_wif') {
+        authenticationHelp = selectedProfile.provider === 'openai' ?
+            'OpenAI 조직의 Identity Provider와 서비스 계정 매핑을 사용합니다. 일반 OpenAI 사용자 계정 로그인은 API에서 제공되지 않습니다.' :
+            'Anthropic 조직의 Federation Rule과 서비스 계정 매핑을 사용합니다.';
+      } else if (state.model.authenticationMethod === 'cli_oauth') {
+        authenticationHelp = 'MEWEB은 사설 OAuth 클라이언트를 내장하지 않고 Anthropic 공식 ant auth login에 사용자 로그인을 위임합니다.';
+      } else if (state.model.authenticationMethod === 'api_key') {
+        authenticationHelp = `${selectedProfile.credentialReference}를 OS Keychain 또는 실행 환경에서 런타임이 읽습니다.`;
+      }
       const runtimePreview = JSON.stringify(effectiveModelRuntime(), null, 2);
       setHtml(content, `<h1>AI 모델</h1><p class="lede">모델 공급자를 바꿔도 같은 시스템 프롬프트와 안전 정책을 사용합니다.</p>
         <section class="settings-card"><h2>모델 프로필</h2>
@@ -559,7 +643,11 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
             return `<button class="model-card" data-model-profile="${esc(id)}" aria-pressed="${id === state.model.selected}"><b>${esc(profile.providerLabel)} · ${esc(profile.name)}</b><small>컨텍스트 ${profile.maxContextTokens.toLocaleString()} · ${esc(profile.toolFormat)}</small></button>`;
           }).join('')}</div></div>
           ${row('API 주소', endpointEditable ? '로컬 모델은 localhost 또는 loopback 주소만 허용합니다.' : '클라우드 공급자의 검증된 기본 주소로 잠겨 있습니다.', `<div class="setting-control"><input class="text-input" id="modelEndpointInput" maxlength="300" value="${esc(state.model.endpoint)}" ${endpointEditable ? '' : 'disabled'}></div>`)}
-          <div class="setting-row"><div class="note"><b>API 키는 이 화면에 입력하거나 저장하지 않습니다.</b><br>${selectedProfile.credentialReference ? `${esc(selectedProfile.credentialReference)}를 OS Keychain 또는 실행 환경에서 런타임이 읽습니다.` : '로컬 모델은 기본적으로 별도 키가 필요하지 않습니다.'}</div></div>
+        </section>
+        <section class="settings-card" data-model-authentication="${esc(selectedProfile.provider)}"><h2>공급자 로그인</h2>
+          ${row('인증 방식', 'OpenAI와 Anthropic은 공식 지원 방식만 사용합니다.', optionGroup('model.authenticationMethod', authenticationOptions))}
+          <div class="setting-row"><div class="note"><b>${esc(authenticationMethod.label)} · 비밀값은 이 화면과 Chromium Preferences에 저장하지 않습니다.</b><br>${esc(authenticationHelp)}</div></div>
+          ${row('연결 도구', '단기 액세스 토큰은 메모리에서만 유지합니다.', `<code class="value">${state.model.authenticationMethod === 'cli_oauth' ? 'ant auth login' : state.model.authenticationMethod === 'oauth_wif' ? `meweb_model_oauth.py exchange --provider ${esc(selectedProfile.provider)}` : authenticationMethod.brokerReference || '필요 없음'}</code>`)}
         </section>
         <section class="settings-card"><h2>생성·도구 설정</h2>
           ${row('온도', '결정적인 브라우저 조작을 위해 0.1~0.3을 권장합니다.', `<div class="setting-control"><input type="range" id="modelTemperatureInput" min="0" max="1" step="0.1" value="${state.model.temperature}"><span class="value" id="modelTemperatureValue">${state.model.temperature.toFixed(1)}</span></div>`)}
