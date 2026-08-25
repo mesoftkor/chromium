@@ -5,6 +5,7 @@
 #include "chrome/browser/ui/webui/new_tab_page/new_tab_page_ui.h"
 
 #include <memory>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -12,10 +13,14 @@
 #include <vector>
 
 #include "base/command_line.h"
+#include "base/environment.h"
+#include "base/files/file_util.h"
 #include "base/functional/bind.h"
 #include "base/json/json_reader.h"
+#include "base/json/json_writer.h"
 #include "base/logging.h"
 #include "base/memory/raw_ptr.h"
+#include "base/memory/weak_ptr.h"
 #include "base/metrics/histogram_functions.h"
 #include "base/notreached.h"
 #include "base/strings/strcat.h"
@@ -26,6 +31,7 @@
 #include "base/strings/utf_string_conversions.h"
 #include "base/time/time.h"
 #include "base/values.h"
+#include "build/build_config.h"
 #include "build/branding_buildflags.h"
 #include "chrome/browser/autocomplete/aim_eligibility_service_factory.h"
 #include "chrome/browser/browser_features.h"
@@ -128,9 +134,16 @@
 #include "google_apis/gaia/core_account_id.h"
 #include "media/base/media_switches.h"
 #include "mojo/public/cpp/base/big_buffer.h"
+#include "net/base/net_errors.h"
 #include "net/base/url_util.h"
+#include "net/http/http_response_headers.h"
+#include "net/http/http_request_headers.h"
+#include "net/traffic_annotation/network_traffic_annotation.h"
+#include "services/network/public/cpp/resource_request.h"
 #include "services/network/public/cpp/shared_url_loader_factory.h"
+#include "services/network/public/cpp/simple_url_loader.h"
 #include "services/network/public/mojom/content_security_policy.mojom.h"
+#include "services/network/public/mojom/url_response_head.mojom.h"
 #include "skia/ext/skia_utils_base.h"
 #include "third_party/omnibox_proto/chrome_aim_entry_point.pb.h"
 #include "ui/base/accelerators/accelerator.h"
@@ -198,6 +211,9 @@ constexpr char kPrevNavigationTimePrefName[] = "NewTabPage.PrevNavigationTime";
 constexpr char kMewebAgentWorkspaceStatePref[] =
     "meweb.agent_workspace_state";
 constexpr size_t kMaxMewebAgentWorkspaceStateBytes = 512 * 1024;
+constexpr size_t kMaxMewebModelAuthResponseBytes = 256 * 1024;
+constexpr size_t kMaxMewebIdentityTokenBytes = 64 * 1024;
+constexpr size_t kMaxMewebCredentialBytes = 16 * 1024;
 // The value for the "udm" (Unified Drilldown Mode) query parameter.
 // value "50" triggers AI mode as opposed to traditional search.
 constexpr char kAIMDisplayMode[] = "50";
@@ -222,9 +238,477 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
         "mewebAgentLoadState",
         base::BindRepeating(&MewebAgentWorkspaceHandler::HandleLoadState,
                             base::Unretained(this)));
+    web_ui()->RegisterMessageCallback(
+        "mewebModelAuthStatus",
+        base::BindRepeating(&MewebAgentWorkspaceHandler::HandleModelAuthStatus,
+                            base::Unretained(this)));
+    web_ui()->RegisterMessageCallback(
+        "mewebModelAuthConnect",
+        base::BindRepeating(&MewebAgentWorkspaceHandler::HandleModelAuthConnect,
+                            base::Unretained(this)));
+    web_ui()->RegisterMessageCallback(
+        "mewebModelAuthDisconnect",
+        base::BindRepeating(
+            &MewebAgentWorkspaceHandler::HandleModelAuthDisconnect,
+            base::Unretained(this)));
   }
 
  private:
+  struct MemoryCredential {
+    std::string value;
+    base::Time expires_at;
+  };
+
+  static std::string CredentialKey(std::string_view provider,
+                                   std::string_view method) {
+    return base::StrCat({provider, "/", method});
+  }
+
+  static bool IsSupportedAuthentication(std::string_view provider,
+                                        std::string_view method) {
+    if (provider == "openai") {
+      return method == "oauth_wif" || method == "api_key";
+    }
+    if (provider == "anthropic") {
+      return method == "cli_oauth" || method == "oauth_wif" ||
+             method == "api_key";
+    }
+    if (provider == "gemini") {
+      return method == "oauth_access_token" || method == "api_key";
+    }
+    if (provider == "ollama") {
+      return method == "none" || method == "api_key";
+    }
+    if (provider == "openrouter") {
+      return method == "oauth_pkce" || method == "api_key";
+    }
+    return false;
+  }
+
+  static bool IsLoopbackHost(std::string_view host) {
+    return host == "127.0.0.1" || host == "localhost" || host == "[::1]" ||
+           host == "::1";
+  }
+
+  static bool IsAllowedEndpoint(std::string_view provider, const GURL& url) {
+    if (!url.is_valid() || url.has_username() || url.has_password()) {
+      return false;
+    }
+    if (provider == "ollama") {
+      return ((url.SchemeIsHTTPOrHTTPS() && IsLoopbackHost(url.host())) ||
+              url.DeprecatedGetOriginAsURL() == GURL("https://ollama.com/"));
+    }
+    static constexpr std::pair<std::string_view, std::string_view>
+        kAllowedOrigins[] = {
+            {"openai", "https://api.openai.com/"},
+            {"anthropic", "https://api.anthropic.com/"},
+            {"gemini", "https://generativelanguage.googleapis.com/"},
+            {"openrouter", "https://openrouter.ai/"},
+        };
+    for (const auto& [allowed_provider, origin] : kAllowedOrigins) {
+      if (provider == allowed_provider) {
+        return url.DeprecatedGetOriginAsURL() == GURL(origin);
+      }
+    }
+    return false;
+  }
+
+  static std::string CredentialEnvironmentVariable(
+      std::string_view provider,
+      std::string_view method) {
+    if (method == "api_key") {
+      if (provider == "openai") return "OPENAI_API_KEY";
+      if (provider == "anthropic") return "ANTHROPIC_API_KEY";
+      if (provider == "gemini") return "GEMINI_API_KEY";
+      if (provider == "ollama") return "OLLAMA_API_KEY";
+      if (provider == "openrouter") return "OPENROUTER_API_KEY";
+    }
+    if (provider == "anthropic" && method == "cli_oauth") {
+      return "ANTHROPIC_OAUTH_TOKEN";
+    }
+    if (provider == "gemini" && method == "oauth_access_token") {
+      return "GOOGLE_OAUTH_ACCESS_TOKEN";
+    }
+    if (provider == "openrouter" && method == "oauth_pkce") {
+      return "OPENROUTER_OAUTH_KEY";
+    }
+    return std::string();
+  }
+
+  static GURL ValidationUrl(std::string_view provider, const GURL& endpoint) {
+    if (provider == "openai") return GURL("https://api.openai.com/v1/models");
+    if (provider == "anthropic") {
+      return GURL("https://api.anthropic.com/v1/models");
+    }
+    if (provider == "gemini") {
+      return GURL("https://generativelanguage.googleapis.com/v1beta/models");
+    }
+    if (provider == "openrouter") {
+      return GURL("https://openrouter.ai/api/v1/models");
+    }
+    if (provider == "ollama") {
+      return endpoint.DeprecatedGetOriginAsURL().Resolve("api/version");
+    }
+    return GURL();
+  }
+
+  base::DictValue AuthResult(std::string_view provider,
+                             std::string_view method,
+                             bool connected,
+                             std::string_view status,
+                             std::string_view message) const {
+    base::DictValue result;
+    result.Set("provider", provider);
+    result.Set("method", method);
+    result.Set("connected", connected);
+    result.Set("status", status);
+    result.Set("message", message);
+    result.Set("credential_persisted_by_meweb", false);
+    result.Set("broker", "chromium_native_cxx23");
+    return result;
+  }
+
+  void Reply(const base::Value& callback_id, base::DictValue result) {
+    AllowJavascript();
+    CallJavascriptFunction("mewebModelAuthResponse", callback_id,
+                           base::Value(std::move(result)));
+  }
+
+  void HandleModelAuthStatus(const base::ListValue& args) {
+    if (args.size() != 3 || !args[0].is_string() || !args[1].is_string() ||
+        !args[2].is_string()) {
+      return;
+    }
+    const std::string& provider = args[1].GetString();
+    const std::string& method = args[2].GetString();
+    if (!IsSupportedAuthentication(provider, method)) {
+      Reply(args[0], AuthResult(provider, method, false, "error",
+                                "지원하지 않는 인증 방식입니다."));
+      return;
+    }
+    const std::string key = CredentialKey(provider, method);
+    auto credential = credentials_.find(key);
+    if (credential != credentials_.end() &&
+        (credential->second.expires_at.is_max() ||
+         credential->second.expires_at > base::Time::Now())) {
+      Reply(args[0], AuthResult(provider, method, true, "connected",
+                                "네이티브 메모리 브로커에 연결되어 있습니다."));
+      return;
+    }
+    if (credential != credentials_.end()) credentials_.erase(credential);
+    Reply(args[0], AuthResult(provider, method, false, "disconnected",
+                              "현재 앱 세션에 연결된 자격 증명이 없습니다."));
+  }
+
+  void HandleModelAuthConnect(const base::ListValue& args) {
+    if (args.size() != 5 || !args[0].is_string() || !args[1].is_string() ||
+        !args[2].is_string() || !args[3].is_string() ||
+        !args[4].is_string()) {
+      return;
+    }
+    const std::string& provider = args[1].GetString();
+    const std::string& method = args[2].GetString();
+    std::string credential = args[3].GetString();
+    const GURL endpoint(args[4].GetString());
+    if (!IsSupportedAuthentication(provider, method) ||
+        !IsAllowedEndpoint(provider, endpoint)) {
+      Reply(args[0], AuthResult(provider, method, false, "error",
+                                "공급자 또는 API 주소가 허용되지 않습니다."));
+      return;
+    }
+    if (auth_loader_) {
+      Reply(args[0], AuthResult(provider, method, false, "busy",
+                                "다른 공급자 연결을 확인하고 있습니다."));
+      return;
+    }
+    if (method == "oauth_wif") {
+      BeginWifExchange(args[0].Clone(), provider, method);
+      return;
+    }
+    if (credential.empty()) {
+      const std::string variable =
+          CredentialEnvironmentVariable(provider, method);
+      if (!variable.empty()) {
+        auto environment = base::Environment::Create();
+        if (auto value = environment->GetVar(variable)) {
+          credential = std::move(*value);
+        }
+      }
+    }
+    if (method != "none" &&
+        (credential.empty() || credential.size() > kMaxMewebCredentialBytes)) {
+      Reply(args[0], AuthResult(provider, method, false, "error",
+                                "자격 증명이 없거나 허용 크기를 초과했습니다."));
+      return;
+    }
+    BeginCredentialValidation(args[0].Clone(), provider, method,
+                              std::move(credential), endpoint);
+  }
+
+  void HandleModelAuthDisconnect(const base::ListValue& args) {
+    if (args.size() != 3 || !args[0].is_string() || !args[1].is_string() ||
+        !args[2].is_string()) {
+      return;
+    }
+    const std::string& provider = args[1].GetString();
+    const std::string& method = args[2].GetString();
+    credentials_.erase(CredentialKey(provider, method));
+    Reply(args[0], AuthResult(provider, method, false, "disconnected",
+                              "현재 앱 세션의 연결을 해제했습니다."));
+  }
+
+  void BeginCredentialValidation(base::Value callback_id,
+                                 std::string provider,
+                                 std::string method,
+                                 std::string credential,
+                                 const GURL& endpoint) {
+    auto request = std::make_unique<network::ResourceRequest>();
+    request->url = ValidationUrl(provider, endpoint);
+    request->method = "GET";
+    request->credentials_mode = network::mojom::CredentialsMode::kOmit;
+    if (method != "none") {
+      if (provider == "anthropic" && method == "api_key") {
+        request->headers.SetHeader("x-api-key", credential);
+      } else if (provider == "gemini" && method == "api_key") {
+        request->headers.SetHeader("x-goog-api-key", credential);
+      } else {
+        request->headers.SetHeader(net::HttpRequestHeaders::kAuthorization,
+                                   base::StrCat({"Bearer ", credential}));
+      }
+      if (provider == "anthropic") {
+        request->headers.SetHeader("anthropic-version", "2023-06-01");
+      }
+    }
+    StartRequest(
+        std::move(request), std::string(),
+        base::BindOnce(&MewebAgentWorkspaceHandler::OnCredentialValidated,
+                       weak_ptr_factory_.GetWeakPtr(), std::move(callback_id),
+                       std::move(provider), std::move(method),
+                       std::move(credential)));
+  }
+
+  void OnCredentialValidated(base::Value callback_id,
+                             std::string provider,
+                             std::string method,
+                             std::string credential,
+                             bool success,
+                             std::optional<std::string> body) {
+    if (!success) {
+      Reply(callback_id,
+            AuthResult(provider, method, false, "error",
+                       "공급자 연결 검증에 실패했습니다. 주소와 자격 증명을 확인하세요."));
+      return;
+    }
+    credentials_.insert_or_assign(
+        CredentialKey(provider, method),
+        MemoryCredential{std::move(credential), base::Time::Max()});
+    Reply(callback_id,
+          AuthResult(provider, method, true, "connected",
+                     provider == "ollama" ?
+                         "Ollama API 연결과 버전 응답을 확인했습니다." :
+                         "공급자 API 연결과 자격 증명을 확인했습니다."));
+  }
+
+  bool ReadIdentityToken(const std::string& path_value,
+                         std::string* token,
+                         std::string* error) {
+    const base::FilePath path = base::FilePath::FromUTF8Unsafe(path_value);
+    if (path.empty() || base::IsLink(path)) {
+      *error = "ID 토큰은 심볼릭 링크가 아닌 파일이어야 합니다.";
+      return false;
+    }
+#if BUILDFLAG(IS_POSIX)
+    int permissions = 0;
+    if (!base::GetPosixFilePermissions(path, &permissions) ||
+        (permissions & (base::FILE_PERMISSION_GROUP_MASK |
+                        base::FILE_PERMISSION_OTHERS_MASK))) {
+      *error = "ID 토큰 파일 권한은 소유자 전용이어야 합니다.";
+      return false;
+    }
+#endif
+    if (!base::ReadFileToStringWithMaxSize(
+            path, token, kMaxMewebIdentityTokenBytes) || token->empty()) {
+      *error = "ID 토큰 파일을 안전하게 읽을 수 없습니다.";
+      return false;
+    }
+    base::TrimWhitespaceASCII(*token, base::TRIM_ALL, token);
+    return !token->empty();
+  }
+
+  void BeginWifExchange(base::Value callback_id,
+                        std::string provider,
+                        std::string method) {
+    auto environment = base::Environment::Create();
+    auto required = [&](std::string_view name, std::string* output) {
+      const std::string variable_name(name);
+      auto value = environment->GetVar(variable_name);
+      if (!value || value->empty()) return false;
+      *output = std::move(*value);
+      return true;
+    };
+    std::string token_path;
+    std::string subject_token;
+    std::string first_id;
+    std::string organization_id;
+    std::string service_account_id;
+    std::string workspace_id;
+    base::DictValue payload;
+    GURL token_endpoint;
+    if (provider == "openai") {
+      if (!required("OPENAI_IDENTITY_TOKEN_FILE", &token_path) ||
+          !required("OPENAI_IDENTITY_PROVIDER_ID", &first_id) ||
+          !required("OPENAI_SERVICE_ACCOUNT_ID", &service_account_id)) {
+        Reply(callback_id,
+              AuthResult(provider, method, false, "missing_configuration",
+                         "OpenAI WIF 환경 설정 3개가 필요합니다."));
+        return;
+      }
+      payload.Set("grant_type",
+                  "urn:ietf:params:oauth:grant-type:token-exchange");
+      payload.Set("subject_token_type",
+                  "urn:ietf:params:oauth:token-type:jwt");
+      payload.Set("identity_provider_id", first_id);
+      payload.Set("service_account_id", service_account_id);
+      token_endpoint = GURL("https://auth.openai.com/oauth/token");
+    } else {
+      if (!required("ANTHROPIC_IDENTITY_TOKEN_FILE", &token_path) ||
+          !required("ANTHROPIC_FEDERATION_RULE_ID", &first_id) ||
+          !required("ANTHROPIC_ORGANIZATION_ID", &organization_id) ||
+          !required("ANTHROPIC_SERVICE_ACCOUNT_ID", &service_account_id)) {
+        Reply(callback_id,
+              AuthResult(provider, method, false, "missing_configuration",
+                         "Anthropic WIF 환경 설정 4개가 필요합니다."));
+        return;
+      }
+      payload.Set("grant_type",
+                  "urn:ietf:params:oauth:grant-type:jwt-bearer");
+      payload.Set("federation_rule_id", first_id);
+      payload.Set("organization_id", organization_id);
+      payload.Set("service_account_id", service_account_id);
+      if (auto value = environment->GetVar("ANTHROPIC_WORKSPACE_ID");
+          value && !value->empty()) {
+        workspace_id = std::move(*value);
+        payload.Set("workspace_id", workspace_id);
+      }
+      token_endpoint = GURL("https://api.anthropic.com/v1/oauth/token");
+    }
+    std::string read_error;
+    if (!ReadIdentityToken(token_path, &subject_token, &read_error)) {
+      Reply(callback_id,
+            AuthResult(provider, method, false, "invalid_token_file",
+                       read_error));
+      return;
+    }
+    payload.Set(provider == "openai" ? "subject_token" : "assertion",
+                subject_token);
+    std::string body;
+    if (!base::JSONWriter::Write(payload, &body)) {
+      Reply(callback_id, AuthResult(provider, method, false, "error",
+                                    "WIF 요청을 만들 수 없습니다."));
+      return;
+    }
+    auto request = std::make_unique<network::ResourceRequest>();
+    request->url = token_endpoint;
+    request->method = "POST";
+    request->credentials_mode = network::mojom::CredentialsMode::kOmit;
+    StartRequest(
+        std::move(request), std::move(body),
+        base::BindOnce(&MewebAgentWorkspaceHandler::OnWifExchanged,
+                       weak_ptr_factory_.GetWeakPtr(), std::move(callback_id),
+                       std::move(provider), std::move(method)));
+  }
+
+  void OnWifExchanged(base::Value callback_id,
+                      std::string provider,
+                      std::string method,
+                      bool success,
+                      std::optional<std::string> body) {
+    if (!success || !body) {
+      Reply(callback_id,
+            AuthResult(provider, method, false, "error",
+                       "WIF 토큰 교환이 공급자에서 거부되었습니다."));
+      return;
+    }
+    auto parsed = base::JSONReader::Read(*body, 0);
+    if (!parsed || !parsed->is_dict()) {
+      Reply(callback_id, AuthResult(provider, method, false, "error",
+                                    "WIF 응답 형식이 올바르지 않습니다."));
+      return;
+    }
+    const std::string* access_token =
+        parsed->GetDict().FindString("access_token");
+    const std::optional<int> expires_in =
+        parsed->GetDict().FindInt("expires_in");
+    if (!access_token || access_token->empty() || !expires_in ||
+        *expires_in <= 0 || *expires_in > 3600) {
+      Reply(callback_id, AuthResult(provider, method, false, "error",
+                                    "WIF 응답의 토큰 만료값이 올바르지 않습니다."));
+      return;
+    }
+    credentials_.insert_or_assign(
+        CredentialKey(provider, method),
+        MemoryCredential{*access_token,
+                         base::Time::Now() + base::Seconds(*expires_in)});
+    auto result = AuthResult(provider, method, true, "connected",
+                             "단기 WIF 토큰을 메모리에 연결했습니다.");
+    result.Set("expires_in", *expires_in);
+    Reply(callback_id, std::move(result));
+  }
+
+  using RequestCallback = base::OnceCallback<void(
+      bool success, std::optional<std::string> response_body)>;
+
+  void StartRequest(std::unique_ptr<network::ResourceRequest> request,
+                    std::string upload_body,
+                    RequestCallback callback) {
+    constexpr net::NetworkTrafficAnnotationTag traffic_annotation =
+        net::DefineNetworkTrafficAnnotation("meweb_model_auth_broker", R"(
+          semantics {
+            sender: "MEWEB model authentication broker"
+            description:
+              "Validates a model provider credential or exchanges a workload "
+              "identity token after the user selects Connect in MEWEB settings."
+            trigger: "The user selects Connect for an AI model provider."
+            data:
+              "A provider API credential or workload identity token. The "
+              "credential is held in process memory and is not persisted by MEWEB."
+            destination: OTHER
+          }
+          policy {
+            cookies_allowed: NO
+            setting:
+              "The request is made only from the AI model provider settings "
+              "screen and can be disconnected there."
+            policy_exception_justification:
+              "This is a user-selected model provider connection."
+          })");
+    auth_loader_ =
+        network::SimpleURLLoader::Create(std::move(request), traffic_annotation);
+    if (!upload_body.empty()) {
+      auth_loader_->AttachStringForUpload(std::move(upload_body),
+                                          "application/json");
+    }
+    auth_loader_->DownloadToString(
+        profile_->GetURLLoaderFactory().get(),
+        base::BindOnce(&MewebAgentWorkspaceHandler::OnRequestFinished,
+                       weak_ptr_factory_.GetWeakPtr(), std::move(callback)),
+        kMaxMewebModelAuthResponseBytes);
+  }
+
+  void OnRequestFinished(RequestCallback callback,
+                         std::optional<std::string> body) {
+    bool success = auth_loader_ && auth_loader_->NetError() == net::OK &&
+                   auth_loader_->ResponseInfo() &&
+                   auth_loader_->ResponseInfo()->headers &&
+                   auth_loader_->ResponseInfo()->headers->response_code() >=
+                       200 &&
+                   auth_loader_->ResponseInfo()->headers->response_code() <=
+                       299 &&
+                   body.has_value();
+    auth_loader_.reset();
+    std::move(callback).Run(success, std::move(body));
+  }
+
   void HandleSaveState(const base::ListValue& args) {
     if (args.size() == 1 && args[0].is_string()) {
       const std::string& serialized = args[0].GetString();
@@ -250,6 +734,9 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
   }
 
   raw_ptr<Profile> profile_;
+  std::map<std::string, MemoryCredential> credentials_;
+  std::unique_ptr<network::SimpleURLLoader> auth_loader_;
+  base::WeakPtrFactory<MewebAgentWorkspaceHandler> weak_ptr_factory_{this};
 };
 
 bool HasCredentials(Profile* profile) {

@@ -68,6 +68,20 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
   'use strict';
 
   const STORAGE_KEY = 'meweb.agent.workspace.v1';
+  let modelAuthRequestSequence = 0;
+  const pendingModelAuthRequests = new Map();
+  window.mewebModelAuthResponse = (requestId, result) => {
+    const resolve = pendingModelAuthRequests.get(requestId);
+    if (!resolve) return;
+    pendingModelAuthRequests.delete(requestId);
+    resolve(result);
+  };
+  const sendModelAuthRequest = (method, ...args) => new Promise(resolve => {
+    const requestId = `meweb-model-auth-${++modelAuthRequestSequence}`;
+    pendingModelAuthRequests.set(requestId, resolve);
+    // eslint-disable-next-line no-restricted-properties
+    chrome.send(method, [requestId, ...args]);
+  });
   // Dynamic values are escaped before they reach this policy. Keeping the
   // policy local to the MEWEB NTP lets Chromium's Trusted Types enforcement
   // remain enabled for every other script sink.
@@ -133,12 +147,16 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       endpoint: 'https://api.openai.com/v1/chat/completions',
       temperature: 0.2, maxContextTokens: 4096, maxOutputTokens: 4096,
       credentialReference: 'OPENAI_API_KEY', toolFormat: 'tools',
+      defaultAuthenticationMethod: 'oauth_wif',
+      allowedAuthenticationMethods: ['oauth_wif', 'api_key'],
     },
     'openai/gpt-4.1': {
       provider: 'openai', providerLabel: 'OpenAI', name: 'gpt-4.1',
       endpoint: 'https://api.openai.com/v1/chat/completions',
       temperature: 0.1, maxContextTokens: 8192, maxOutputTokens: 4096,
       credentialReference: 'OPENAI_API_KEY', toolFormat: 'tools',
+      defaultAuthenticationMethod: 'oauth_wif',
+      allowedAuthenticationMethods: ['oauth_wif', 'api_key'],
     },
     'anthropic/claude-3-5-sonnet': {
       provider: 'anthropic', providerLabel: 'Anthropic',
@@ -146,29 +164,56 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       endpoint: 'https://api.anthropic.com/v1/messages',
       temperature: 0.2, maxContextTokens: 200000, maxOutputTokens: 4096,
       credentialReference: 'ANTHROPIC_API_KEY', toolFormat: 'tool_use',
+      defaultAuthenticationMethod: 'cli_oauth',
+      allowedAuthenticationMethods: ['cli_oauth', 'oauth_wif', 'api_key'],
     },
-    'google/gemini-1-5-pro': {
-      provider: 'google', providerLabel: 'Google', name: 'gemini-1.5-pro',
-      endpoint: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent',
+    'gemini/gemini-3.6-flash': {
+      provider: 'gemini', providerLabel: 'Gemini', name: 'gemini-3.6-flash',
+      endpoint: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent',
       temperature: 0.2, maxContextTokens: 1000000, maxOutputTokens: 4096,
       credentialReference: 'GEMINI_API_KEY',
       toolFormat: 'functionDeclarations',
+      defaultAuthenticationMethod: 'api_key',
+      allowedAuthenticationMethods: ['api_key', 'oauth_access_token'],
     },
-    'local/qwen2.5-14b': {
-      provider: 'local', providerLabel: 'Local LLM', name: 'qwen2.5-14b',
+    'ollama/qwen2.5-14b': {
+      provider: 'ollama', providerLabel: 'Ollama Local', name: 'qwen2.5-14b',
       endpoint: 'http://127.0.0.1:11434/v1/chat/completions',
       temperature: 0.2, maxContextTokens: 32768, maxOutputTokens: 4096,
       credentialReference: null, toolFormat: 'json_mode',
+      defaultAuthenticationMethod: 'none',
+      allowedAuthenticationMethods: ['none'],
+    },
+    'ollama/gpt-oss-120b-cloud': {
+      provider: 'ollama', providerLabel: 'Ollama Cloud',
+      name: 'gpt-oss:120b', endpoint: 'https://ollama.com/api/chat',
+      temperature: 0.2, maxContextTokens: 131072, maxOutputTokens: 4096,
+      credentialReference: 'OLLAMA_API_KEY', toolFormat: 'tools',
+      defaultAuthenticationMethod: 'api_key',
+      allowedAuthenticationMethods: ['api_key'],
+    },
+    'openrouter/auto': {
+      provider: 'openrouter', providerLabel: 'OpenRouter',
+      name: 'openrouter/auto',
+      endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+      temperature: 0.2, maxContextTokens: 2000000, maxOutputTokens: 4096,
+      credentialReference: 'OPENROUTER_API_KEY', toolFormat: 'tools',
+      defaultAuthenticationMethod: 'api_key',
+      allowedAuthenticationMethods: ['api_key', 'oauth_pkce'],
     },
   };
   const MODEL_PROFILE_IDS = Object.keys(MODEL_PROFILES);
+  const LEGACY_MODEL_PROFILE_IDS = {
+    'google/gemini-1-5-pro': 'gemini/gemini-3.6-flash',
+    'local/qwen2.5-14b': 'ollama/qwen2.5-14b',
+  };
   const MODEL_AUTHENTICATION = {
     openai: {
       defaultMethod: 'oauth_wif',
       methods: {
         oauth_wif: {
           label: 'OAuth 2.0 WIF', accountType: 'service_account',
-          interactive: false, brokerReference: 'meweb-oauth-broker://openai',
+          interactive: false, brokerReference: 'meweb-native-auth://openai',
         },
         api_key: {
           label: 'API 키', accountType: 'service_account',
@@ -181,11 +226,11 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       methods: {
         cli_oauth: {
           label: 'Anthropic 계정 OAuth', accountType: 'user',
-          interactive: true, brokerReference: 'anthropic-ant-cli://default',
+          interactive: true, brokerReference: 'meweb-native-auth://anthropic',
         },
         oauth_wif: {
           label: 'OAuth 2.0 WIF', accountType: 'service_account',
-          interactive: false, brokerReference: 'meweb-oauth-broker://anthropic',
+          interactive: false, brokerReference: 'meweb-native-auth://anthropic',
         },
         api_key: {
           label: 'API 키', accountType: 'service_account',
@@ -193,19 +238,44 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
         },
       },
     },
-    google: {
+    gemini: {
       defaultMethod: 'api_key',
-      methods: {api_key: {
-        label: 'API 키', accountType: 'service_account',
-        interactive: false, brokerReference: 'GEMINI_API_KEY',
-      }},
+      methods: {
+        api_key: {
+          label: 'API 키', accountType: 'service_account',
+          interactive: true, brokerReference: 'meweb-native-auth://gemini',
+        },
+        oauth_access_token: {
+          label: 'Google OAuth', accountType: 'user',
+          interactive: true, brokerReference: 'meweb-native-auth://gemini',
+        },
+      },
     },
-    local: {
+    ollama: {
       defaultMethod: 'none',
-      methods: {none: {
-        label: '인증 없음', accountType: 'local',
-        interactive: false, brokerReference: null,
-      }},
+      methods: {
+        none: {
+          label: '로컬 연결', accountType: 'local',
+          interactive: false, brokerReference: 'meweb-native-auth://ollama',
+        },
+        api_key: {
+          label: 'Ollama Cloud API 키', accountType: 'service_account',
+          interactive: true, brokerReference: 'meweb-native-auth://ollama',
+        },
+      },
+    },
+    openrouter: {
+      defaultMethod: 'api_key',
+      methods: {
+        api_key: {
+          label: 'API 키', accountType: 'user', interactive: true,
+          brokerReference: 'meweb-native-auth://openrouter',
+        },
+        oauth_pkce: {
+          label: 'OAuth PKCE 키', accountType: 'user', interactive: true,
+          brokerReference: 'meweb-native-auth://openrouter',
+        },
+      },
     },
   };
   const MODEL_TOOL_CHOICES = ['required', 'auto', 'none'];
@@ -242,11 +312,13 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
   }
 
   function modelDefaults(profileId = 'openai/gpt-4o-mini') {
-    const selected = MODEL_PROFILES[profileId] ? profileId : MODEL_PROFILE_IDS[0];
+    const migrated = LEGACY_MODEL_PROFILE_IDS[profileId] || profileId;
+    const selected = MODEL_PROFILES[migrated] ? migrated : MODEL_PROFILE_IDS[0];
     const profile = MODEL_PROFILES[selected];
     return {
       selected,
       authenticationMethod:
+          profile.defaultAuthenticationMethod ||
           MODEL_AUTHENTICATION[profile.provider].defaultMethod,
       endpoint: profile.endpoint,
       temperature: profile.temperature,
@@ -261,8 +333,9 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
 
   function sanitizeModelSettings(candidate) {
     const source = candidate && typeof candidate === 'object' ? candidate : {};
-    const selected = MODEL_PROFILES[source.selected] ?
-        source.selected : 'openai/gpt-4o-mini';
+    const migrated = LEGACY_MODEL_PROFILE_IDS[source.selected] || source.selected;
+    const selected = MODEL_PROFILES[migrated] ?
+        migrated : 'openai/gpt-4o-mini';
     const profile = MODEL_PROFILES[selected];
     const defaultsForProfile = modelDefaults(selected);
     const temperature = Number(source.temperature);
@@ -272,9 +345,12 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     return {
       selected,
       authenticationMethod:
-          authentication.methods[source.authenticationMethod] ?
-          source.authenticationMethod : authentication.defaultMethod,
-      endpoint: profile.provider === 'local' &&
+          authentication.methods[source.authenticationMethod] &&
+              profile.allowedAuthenticationMethods.includes(
+                  source.authenticationMethod) ?
+          source.authenticationMethod : profile.defaultAuthenticationMethod,
+      endpoint: profile.provider === 'ollama' &&
+              profile.allowedAuthenticationMethods.includes('none') &&
               isLoopbackEndpoint(source.endpoint) ?
           String(source.endpoint) : profile.endpoint,
       temperature: Number.isFinite(temperature) &&
@@ -310,10 +386,13 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     if (!profile) errors.push('지원하지 않는 모델 프로필입니다.');
     if (profile) {
       const authentication = MODEL_AUTHENTICATION[profile.provider];
-      if (!authentication.methods[candidate.authenticationMethod]) {
+      if (!authentication.methods[candidate.authenticationMethod] ||
+          !profile.allowedAuthenticationMethods.includes(
+              candidate.authenticationMethod)) {
         errors.push('선택한 공급자에서 지원하지 않는 인증 방식입니다.');
       }
-      if (profile.provider === 'local') {
+      if (profile.provider === 'ollama' &&
+          profile.allowedAuthenticationMethods.includes('none')) {
         if (!isLoopbackEndpoint(candidate.endpoint)) {
           errors.push('로컬 모델 주소는 localhost 또는 loopback만 허용합니다.');
         }
@@ -355,8 +434,8 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     const authentication =
         MODEL_AUTHENTICATION[profile.provider].methods[
             settings.authenticationMethod];
-    const credentialReference = settings.authenticationMethod === 'api_key' ?
-        profile.credentialReference : authentication.brokerReference;
+    const credentialReference = authentication.brokerReference ||
+        profile.credentialReference;
     return {
       schema_version: 'meweb-agent-model-runtime-v1',
       selected_model: {
@@ -375,6 +454,9 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
           account_type: authentication.accountType,
           interactive_login: authentication.interactive,
           broker_reference: authentication.brokerReference,
+          native_broker: true,
+          provider_connection_required:
+              settings.authenticationMethod !== 'none',
           token_persisted_by_meweb: false,
         },
       },
@@ -391,6 +473,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       security: {
         credentials_persisted: false,
         oauth_access_tokens_memory_only: true,
+        python_runtime_required: false,
         cloud_endpoints_locked: true,
         local_endpoint_loopback_only: true,
         publish_click_guard: true,
@@ -436,6 +519,10 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
   }
 
   let state = loadState();
+  let modelAuthConnection = {
+    key: '', status: 'unknown', connected: false,
+    message: '연결 상태를 확인하지 않았습니다.',
+  };
   let currentView = 'start';
   let settingsSection = 'agent';
   let engineMenuOpen = false;
@@ -624,6 +711,8 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       const authenticationMethod =
           authentication.methods[state.model.authenticationMethod];
       const authenticationOptions = Object.entries(authentication.methods)
+          .filter(([id]) =>
+            selectedProfile.allowedAuthenticationMethods.includes(id))
           .map(([id, definition]) => [id, id, definition.label]);
       let authenticationHelp = '이 모델은 별도 로그인이 필요하지 않습니다.';
       if (state.model.authenticationMethod === 'oauth_wif') {
@@ -631,10 +720,29 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
             'OpenAI 조직의 Identity Provider와 서비스 계정 매핑을 사용합니다. 일반 OpenAI 사용자 계정 로그인은 API에서 제공되지 않습니다.' :
             'Anthropic 조직의 Federation Rule과 서비스 계정 매핑을 사용합니다.';
       } else if (state.model.authenticationMethod === 'cli_oauth') {
-        authenticationHelp = 'MEWEB은 사설 OAuth 클라이언트를 내장하지 않고 Anthropic 공식 ant auth login에 사용자 로그인을 위임합니다.';
+        authenticationHelp = 'Anthropic 공식 ant auth login 후 ant auth print-credentials --access-token으로 받은 단기 토큰을 현재 앱 세션에 연결합니다.';
+      } else if (state.model.authenticationMethod === 'oauth_access_token') {
+        authenticationHelp = 'Google OAuth 데스크톱 앱 흐름에서 발급한 액세스 토큰을 현재 앱 세션에만 연결합니다.';
+      } else if (state.model.authenticationMethod === 'oauth_pkce') {
+        authenticationHelp = 'OpenRouter 공식 PKCE 흐름이 반환한 사용자 제어 API 키를 현재 앱 세션에 연결합니다.';
       } else if (state.model.authenticationMethod === 'api_key') {
-        authenticationHelp = `${selectedProfile.credentialReference}를 OS Keychain 또는 실행 환경에서 런타임이 읽습니다.`;
+        authenticationHelp = `${selectedProfile.credentialReference} 또는 아래 입력값을 C++23 네이티브 브로커가 현재 앱 세션 메모리에서만 사용합니다.`;
       }
+      const authKey = `${selectedProfile.provider}/${state.model.authenticationMethod}`;
+      const displayedAuthStatus = modelAuthConnection.key === authKey ?
+          modelAuthConnection : {
+            status: 'unknown', connected: false,
+            message: '연결 상태를 확인하지 않았습니다.',
+          };
+      const needsCredentialInput = !['none', 'oauth_wif'].includes(
+          state.model.authenticationMethod);
+      const credentialPlaceholder = state.model.authenticationMethod ===
+              'cli_oauth' ? 'Anthropic OAuth 액세스 토큰' :
+          state.model.authenticationMethod === 'oauth_access_token' ?
+              'Google OAuth 액세스 토큰' :
+          state.model.authenticationMethod === 'oauth_pkce' ?
+              'OpenRouter PKCE로 발급된 키' :
+              `${selectedProfile.providerLabel} API 키`;
       const runtimePreview = JSON.stringify(effectiveModelRuntime(), null, 2);
       setHtml(content, `<h1>AI 모델</h1><p class="lede">모델 공급자를 바꿔도 같은 시스템 프롬프트와 안전 정책을 사용합니다.</p>
         <section class="settings-card"><h2>모델 프로필</h2>
@@ -646,8 +754,9 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
         </section>
         <section class="settings-card" data-model-authentication="${esc(selectedProfile.provider)}"><h2>공급자 로그인</h2>
           ${row('인증 방식', 'OpenAI와 Anthropic은 공식 지원 방식만 사용합니다.', optionGroup('model.authenticationMethod', authenticationOptions))}
-          <div class="setting-row"><div class="note"><b>${esc(authenticationMethod.label)} · 비밀값은 이 화면과 Chromium Preferences에 저장하지 않습니다.</b><br>${esc(authenticationHelp)}</div></div>
-          ${row('연결 도구', '단기 액세스 토큰은 메모리에서만 유지합니다.', `<code class="value">${state.model.authenticationMethod === 'cli_oauth' ? 'ant auth login' : state.model.authenticationMethod === 'oauth_wif' ? `meweb_model_oauth.py exchange --provider ${esc(selectedProfile.provider)}` : authenticationMethod.brokerReference || '필요 없음'}</code>`)}
+          <div class="setting-row"><div class="note"><b>${esc(authenticationMethod.label)} · 비밀값은 Chromium Preferences와 localStorage에 저장하지 않습니다.</b><br>${esc(authenticationHelp)}</div></div>
+          ${row('네이티브 연결', 'Python 없이 Chromium C++23 브로커가 검증합니다.', `<div class="setting-control">${needsCredentialInput ? `<input class="text-input" type="password" id="modelCredentialInput" maxlength="16384" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="${esc(credentialPlaceholder)}">` : ''}<button class="btn primary" id="connectModelProviderButton">연결</button><button class="btn" id="checkModelProviderButton">상태 확인</button><button class="btn" id="disconnectModelProviderButton" ${displayedAuthStatus.connected ? '' : 'disabled'}>연결 해제</button></div>`)}
+          <div class="setting-row"><div class="validation ${displayedAuthStatus.status === 'error' ? 'error' : ''}" id="modelAuthStatus" data-status="${esc(displayedAuthStatus.status)}">${esc(displayedAuthStatus.message)}</div></div>
         </section>
         <section class="settings-card"><h2>생성·도구 설정</h2>
           ${row('온도', '결정적인 브라우저 조작을 위해 0.1~0.3을 권장합니다.', `<div class="setting-control"><input type="range" id="modelTemperatureInput" min="0" max="1" step="0.1" value="${state.model.temperature}"><span class="value" id="modelTemperatureValue">${state.model.temperature.toFixed(1)}</span></div>`)}
@@ -860,6 +969,93 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     return true;
   }
 
+  function selectedAuthentication() {
+    const profile = modelProfile();
+    return {
+      provider: profile.provider,
+      method: state.model.authenticationMethod,
+      endpoint: state.model.endpoint,
+      key: `${profile.provider}/${state.model.authenticationMethod}`,
+    };
+  }
+
+  function applyModelAuthResult(result) {
+    const selected = selectedAuthentication();
+    if (!result || result.provider !== selected.provider ||
+        result.method !== selected.method) {
+      return false;
+    }
+    modelAuthConnection = {
+      key: selected.key,
+      status: result.status || 'error',
+      connected: result.connected === true,
+      message: result.message || '공급자 연결 결과가 없습니다.',
+    };
+    renderSettings();
+    return modelAuthConnection.connected;
+  }
+
+  async function checkModelProviderConnection() {
+    const selected = selectedAuthentication();
+    try {
+      const result = await sendModelAuthRequest(
+          'mewebModelAuthStatus', selected.provider, selected.method);
+      applyModelAuthResult(result);
+      return result;
+    } catch (_error) {
+      applyModelAuthResult({
+        ...selected, status: 'error', connected: false,
+        message: '네이티브 인증 브로커의 상태를 확인하지 못했습니다.',
+      });
+      return null;
+    }
+  }
+
+  async function connectModelProvider() {
+    const selected = selectedAuthentication();
+    const input = $('#modelCredentialInput');
+    const credential = input?.value || '';
+    if (input) input.value = '';
+    modelAuthConnection = {
+      key: selected.key, status: 'connecting', connected: false,
+      message: '공급자 연결과 자격 증명을 검증하고 있습니다.',
+    };
+    renderSettings();
+    try {
+      const result = await sendModelAuthRequest(
+          'mewebModelAuthConnect', selected.provider, selected.method,
+          credential, selected.endpoint);
+      applyModelAuthResult(result);
+      if (result?.connected) {
+        record(`AI 모델 공급자를 네이티브 브로커에 연결했습니다: ${selected.key}`);
+        toast('모델 공급자 연결을 확인했습니다.');
+      } else {
+        toast('모델 공급자 연결을 완료하지 못했습니다.');
+      }
+      return result;
+    } catch (_error) {
+      applyModelAuthResult({
+        ...selected, status: 'error', connected: false,
+        message: '네이티브 인증 브로커 호출에 실패했습니다.',
+      });
+      return null;
+    }
+  }
+
+  async function disconnectModelProvider() {
+    const selected = selectedAuthentication();
+    try {
+      const result = await sendModelAuthRequest(
+          'mewebModelAuthDisconnect', selected.provider, selected.method);
+      applyModelAuthResult(result);
+      record(`AI 모델 공급자의 메모리 연결을 해제했습니다: ${selected.key}`);
+      toast('모델 공급자 연결을 해제했습니다.');
+      return result;
+    } catch (_error) {
+      return null;
+    }
+  }
+
   document.addEventListener('click', event => {
     const removeLinkTarget = event.target.closest('[data-remove-link]');
     if (removeLinkTarget) {
@@ -919,6 +1115,9 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       case 'addWorkflowButton': addWorkflow(); break;
       case 'applyModelSettingsButton': applyModelSettings(); break;
       case 'resetModelSettingsButton': state.model = modelDefaults(); record('AI 모델 설정을 기본값으로 되돌렸습니다.'); renderAll(); toast('모델 설정을 기본값으로 되돌렸습니다.'); break;
+      case 'connectModelProviderButton': connectModelProvider(); break;
+      case 'checkModelProviderButton': checkModelProviderConnection(); break;
+      case 'disconnectModelProviderButton': disconnectModelProvider(); break;
       case 'openChromeSettingsButton': window.location.assign('chrome://settings/'); break;
       case 'openUpdateSettingsButton': window.location.assign('chrome://settings/help'); break;
     }
@@ -959,6 +1158,14 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     openView: view => switchView(view),
     setAutonomy: value => { state.persona.autonomy = value; state.task.decisions = {}; save(); renderAll(); },
     getModelRuntimeConfig: () => JSON.parse(JSON.stringify(effectiveModelRuntime())),
+    getModelAuthStatus: () => JSON.parse(JSON.stringify(modelAuthConnection)),
+    connectModelProvider: credential => {
+      const input = $('#modelCredentialInput');
+      if (input) input.value = credential || '';
+      return connectModelProvider();
+    },
+    checkModelProviderConnection: () => checkModelProviderConnection(),
+    disconnectModelProvider: () => disconnectModelProvider(),
     validateModelSettings: value => JSON.parse(JSON.stringify(validateModelSettings(value))),
     setModelProfile: value => selectModelProfile(value),
     importModelSettings: value => {
