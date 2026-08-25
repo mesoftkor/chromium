@@ -4,8 +4,9 @@
 
 #include "chrome/browser/ui/webui/new_tab_page/new_tab_page_ui.h"
 
-#include <memory>
+#include <initializer_list>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -212,8 +213,12 @@ constexpr char kMewebAgentWorkspaceStatePref[] =
     "meweb.agent_workspace_state";
 constexpr size_t kMaxMewebAgentWorkspaceStateBytes = 512 * 1024;
 constexpr size_t kMaxMewebModelAuthResponseBytes = 256 * 1024;
+constexpr size_t kMaxMewebModelInferenceResponseBytes = 1024 * 1024;
 constexpr size_t kMaxMewebIdentityTokenBytes = 64 * 1024;
 constexpr size_t kMaxMewebCredentialBytes = 16 * 1024;
+constexpr size_t kMaxMewebModelPromptBytes = 64 * 1024;
+constexpr size_t kMaxMewebModelToolsBytes = 64 * 1024;
+constexpr char kMewebModelTestOriginSwitch[] = "meweb-model-test-origin";
 // The value for the "udm" (Unified Drilldown Mode) query parameter.
 // value "50" triggers AI mode as opposed to traditional search.
 constexpr char kAIMDisplayMode[] = "50";
@@ -251,12 +256,26 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
         base::BindRepeating(
             &MewebAgentWorkspaceHandler::HandleModelAuthDisconnect,
             base::Unretained(this)));
+    web_ui()->RegisterMessageCallback(
+        "mewebModelGenerate",
+        base::BindRepeating(&MewebAgentWorkspaceHandler::HandleModelGenerate,
+                            base::Unretained(this)));
+    web_ui()->RegisterMessageCallback(
+        "mewebModelCancel",
+        base::BindRepeating(&MewebAgentWorkspaceHandler::HandleModelCancel,
+                            base::Unretained(this)));
   }
 
  private:
   struct MemoryCredential {
     std::string value;
     base::Time expires_at;
+  };
+
+  struct PendingInference {
+    base::Value callback_id;
+    std::string provider;
+    std::string model;
   };
 
   static std::string CredentialKey(std::string_view provider,
@@ -313,6 +332,21 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     return false;
   }
 
+  static std::optional<GURL> ModelTestOrigin() {
+#if !defined(OFFICIAL_BUILD)
+    const std::string value =
+        base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
+            kMewebModelTestOriginSwitch);
+    const GURL url(value);
+    if (!value.empty() && url.is_valid() && url.SchemeIsHTTPOrHTTPS() &&
+        IsLoopbackHost(url.host()) && !url.has_username() &&
+        !url.has_password()) {
+      return url.DeprecatedGetOriginAsURL();
+    }
+#endif
+    return std::nullopt;
+  }
+
   static std::string CredentialEnvironmentVariable(
       std::string_view provider,
       std::string_view method) {
@@ -336,6 +370,9 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
   }
 
   static GURL ValidationUrl(std::string_view provider, const GURL& endpoint) {
+    if (auto test_origin = ModelTestOrigin()) {
+      return test_origin->Resolve(base::StrCat({provider, "/models"}));
+    }
     if (provider == "openai") return GURL("https://api.openai.com/v1/models");
     if (provider == "anthropic") {
       return GURL("https://api.anthropic.com/v1/models");
@@ -348,6 +385,26 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     }
     if (provider == "ollama") {
       return endpoint.DeprecatedGetOriginAsURL().Resolve("api/version");
+    }
+    return GURL();
+  }
+
+  static GURL InferenceUrl(std::string_view provider, const GURL& endpoint) {
+    if (auto test_origin = ModelTestOrigin()) {
+      return test_origin->Resolve(base::StrCat({provider, "/generate"}));
+    }
+    if (provider == "openai") {
+      return GURL("https://api.openai.com/v1/responses");
+    }
+    if (provider == "anthropic") {
+      return GURL("https://api.anthropic.com/v1/messages");
+    }
+    if (provider == "gemini") return endpoint;
+    if (provider == "openrouter") {
+      return GURL("https://openrouter.ai/api/v1/chat/completions");
+    }
+    if (provider == "ollama") {
+      return endpoint.DeprecatedGetOriginAsURL().Resolve("api/chat");
     }
     return GURL();
   }
@@ -455,6 +512,322 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     credentials_.erase(CredentialKey(provider, method));
     Reply(args[0], AuthResult(provider, method, false, "disconnected",
                               "현재 앱 세션의 연결을 해제했습니다."));
+  }
+
+  static void AppendMessage(base::ListValue* messages,
+                            std::string_view role,
+                            std::string_view content) {
+    if (content.empty()) return;
+    base::DictValue message;
+    message.Set("role", role);
+    message.Set("content", content);
+    messages->Append(std::move(message));
+  }
+
+  static std::string JsonString(const base::Value* value) {
+    std::string serialized = "{}";
+    if (value) base::JSONWriter::Write(*value, &serialized);
+    return serialized;
+  }
+
+  static base::ListValue AdaptTools(std::string_view provider,
+                                    const base::ListValue& tools) {
+    base::ListValue adapted;
+    for (const auto& item : tools) {
+      if (!item.is_dict()) continue;
+      const auto& tool = item.GetDict();
+      const std::string* name = tool.FindString("name");
+      if (!name || name->empty() || name->size() > 128) continue;
+      const std::string* description = tool.FindString("description");
+      const base::Value* parameters = tool.Find("parameters");
+      base::DictValue function;
+      function.Set("name", *name);
+      if (description) function.Set("description", *description);
+      function.Set("parameters",
+                   parameters && parameters->is_dict()
+                       ? parameters->Clone()
+                       : base::Value(base::DictValue()));
+      if (provider == "openai") {
+        function.Set("type", "function");
+        function.Set("strict", true);
+        adapted.Append(std::move(function));
+      } else if (provider == "anthropic") {
+        base::DictValue anthropic_tool;
+        anthropic_tool.Set("name", *name);
+        if (description) anthropic_tool.Set("description", *description);
+        anthropic_tool.Set(
+            "input_schema",
+            parameters && parameters->is_dict()
+                ? parameters->Clone()
+                : base::Value(base::DictValue()));
+        adapted.Append(std::move(anthropic_tool));
+      } else {
+        base::DictValue wrapper;
+        wrapper.Set("type", "function");
+        wrapper.Set("function", std::move(function));
+        adapted.Append(std::move(wrapper));
+      }
+    }
+    return adapted;
+  }
+
+  static std::optional<base::DictValue> BuildInferencePayload(
+      std::string_view provider,
+      std::string_view model,
+      std::string_view instructions,
+      std::string_view prompt,
+      int max_output_tokens,
+      double temperature,
+      std::string_view tool_choice,
+      const base::ListValue& tools) {
+    base::DictValue payload;
+    payload.Set("model", model);
+    if (provider == "openai") {
+      payload.Set("input", prompt);
+      if (!instructions.empty()) payload.Set("instructions", instructions);
+      payload.Set("max_output_tokens", max_output_tokens);
+      payload.Set("temperature", temperature);
+      payload.Set("store", false);
+      auto adapted = AdaptTools(provider, tools);
+      if (!adapted.empty()) {
+        payload.Set("tools", std::move(adapted));
+        payload.Set("tool_choice", tool_choice);
+      }
+      return payload;
+    }
+    if (provider == "anthropic") {
+      base::ListValue messages;
+      AppendMessage(&messages, "user", prompt);
+      payload.Set("messages", std::move(messages));
+      if (!instructions.empty()) payload.Set("system", instructions);
+      payload.Set("max_tokens", max_output_tokens);
+      payload.Set("temperature", temperature);
+      auto adapted = AdaptTools(provider, tools);
+      if (!adapted.empty()) {
+        payload.Set("tools", std::move(adapted));
+        base::DictValue choice;
+        choice.Set("type", tool_choice == "required" ? "any" : "auto");
+        payload.Set("tool_choice", std::move(choice));
+      }
+      return payload;
+    }
+    if (provider == "gemini") {
+      payload.Remove("model");
+      base::DictValue user_part;
+      user_part.Set("text", prompt);
+      base::ListValue user_parts;
+      user_parts.Append(std::move(user_part));
+      base::DictValue content;
+      content.Set("role", "user");
+      content.Set("parts", std::move(user_parts));
+      base::ListValue contents;
+      contents.Append(std::move(content));
+      payload.Set("contents", std::move(contents));
+      if (!instructions.empty()) {
+        base::DictValue system_part;
+        system_part.Set("text", instructions);
+        base::ListValue system_parts;
+        system_parts.Append(std::move(system_part));
+        base::DictValue system_instruction;
+        system_instruction.Set("parts", std::move(system_parts));
+        payload.Set("systemInstruction", std::move(system_instruction));
+      }
+      base::DictValue generation_config;
+      generation_config.Set("maxOutputTokens", max_output_tokens);
+      generation_config.Set("temperature", temperature);
+      payload.Set("generationConfig", std::move(generation_config));
+      if (!tools.empty()) {
+        base::ListValue declarations;
+        for (const auto& item : tools) {
+          if (!item.is_dict()) continue;
+          const auto& tool = item.GetDict();
+          const std::string* name = tool.FindString("name");
+          if (!name || name->empty()) continue;
+          base::DictValue declaration;
+          declaration.Set("name", *name);
+          if (const std::string* description =
+                  tool.FindString("description")) {
+            declaration.Set("description", *description);
+          }
+          const base::Value* parameters = tool.Find("parameters");
+          declaration.Set("parameters",
+                          parameters && parameters->is_dict()
+                              ? parameters->Clone()
+                              : base::Value(base::DictValue()));
+          declarations.Append(std::move(declaration));
+        }
+        if (!declarations.empty()) {
+          base::DictValue functions;
+          functions.Set("functionDeclarations", std::move(declarations));
+          base::ListValue gemini_tools;
+          gemini_tools.Append(std::move(functions));
+          payload.Set("tools", std::move(gemini_tools));
+          base::DictValue function_calling;
+          function_calling.Set(
+              "mode", tool_choice == "required" ? "ANY" :
+                      tool_choice == "none" ? "NONE" : "AUTO");
+          base::DictValue tool_config;
+          tool_config.Set("functionCallingConfig", std::move(function_calling));
+          payload.Set("toolConfig", std::move(tool_config));
+        }
+      }
+      return payload;
+    }
+    if (provider == "ollama" || provider == "openrouter") {
+      base::ListValue messages;
+      AppendMessage(&messages, "system", instructions);
+      AppendMessage(&messages, "user", prompt);
+      payload.Set("messages", std::move(messages));
+      if (provider == "ollama") {
+        payload.Set("stream", false);
+        base::DictValue options;
+        options.Set("temperature", temperature);
+        options.Set("num_predict", max_output_tokens);
+        payload.Set("options", std::move(options));
+      } else {
+        payload.Set("max_tokens", max_output_tokens);
+        payload.Set("temperature", temperature);
+      }
+      auto adapted = AdaptTools(provider, tools);
+      if (!adapted.empty()) {
+        payload.Set("tools", std::move(adapted));
+        if (provider == "openrouter") payload.Set("tool_choice", tool_choice);
+      }
+      return payload;
+    }
+    return std::nullopt;
+  }
+
+  base::DictValue InferenceResult(std::string_view provider,
+                                  std::string_view model,
+                                  std::string_view status,
+                                  std::string_view message) const {
+    base::DictValue result;
+    result.Set("provider", provider);
+    result.Set("model", model);
+    result.Set("status", status);
+    result.Set("completed", status == "completed");
+    result.Set("message", message);
+    result.Set("text", "");
+    result.Set("tool_calls", base::ListValue());
+    result.Set("finish_reason", "");
+    base::DictValue usage;
+    usage.Set("input_tokens", 0);
+    usage.Set("output_tokens", 0);
+    usage.Set("total_tokens", 0);
+    result.Set("usage", std::move(usage));
+    result.Set("adapter", "chromium_native_cxx23");
+    result.Set("credential_persisted_by_meweb", false);
+    return result;
+  }
+
+  void HandleModelGenerate(const base::ListValue& args) {
+    if (args.size() != 11 || !args[0].is_string() ||
+        !args[1].is_string() || !args[2].is_string() ||
+        !args[3].is_string() || !args[4].is_string() ||
+        !args[5].is_string() || !args[6].is_string() ||
+        !args[7].is_int() ||
+        (!args[8].is_double() && !args[8].is_int()) ||
+        !args[9].is_string() || !args[10].is_string()) {
+      return;
+    }
+    const std::string& provider = args[1].GetString();
+    const std::string& method = args[2].GetString();
+    const GURL endpoint(args[3].GetString());
+    const std::string& model = args[4].GetString();
+    const std::string& instructions = args[5].GetString();
+    const std::string& prompt = args[6].GetString();
+    const int max_output_tokens = args[7].GetInt();
+    const double temperature = args[8].is_double() ?
+        args[8].GetDouble() : args[8].GetInt();
+    const std::string& tool_choice = args[9].GetString();
+    const std::string& tools_json = args[10].GetString();
+    auto error = [&](std::string_view message) {
+      Reply(args[0], InferenceResult(provider, model, "error", message));
+    };
+    if (!IsSupportedAuthentication(provider, method) ||
+        !IsAllowedEndpoint(provider, endpoint)) {
+      error("공급자, 인증 방식 또는 API 주소가 허용되지 않습니다.");
+      return;
+    }
+    if (inference_loader_) {
+      error("다른 모델 요청이 실행 중입니다.");
+      return;
+    }
+    if (model.empty() || model.size() > 256 || prompt.empty() ||
+        prompt.size() > kMaxMewebModelPromptBytes ||
+        instructions.size() > kMaxMewebModelPromptBytes ||
+        max_output_tokens < 1 || max_output_tokens > 131072 ||
+        temperature < 0 || temperature > 1 ||
+        (tool_choice != "required" && tool_choice != "auto" &&
+         tool_choice != "none") ||
+        tools_json.size() > kMaxMewebModelToolsBytes) {
+      error("모델 요청 값이 허용 범위를 벗어났습니다.");
+      return;
+    }
+    const std::string credential_key = CredentialKey(provider, method);
+    auto credential = credentials_.find(credential_key);
+    if (credential == credentials_.end() ||
+        (!credential->second.expires_at.is_max() &&
+         credential->second.expires_at <= base::Time::Now())) {
+      if (credential != credentials_.end()) credentials_.erase(credential);
+      error("먼저 현재 모델 공급자 연결을 완료하세요.");
+      return;
+    }
+    auto parsed_tools = base::JSONReader::Read(tools_json, 0);
+    if (!parsed_tools || !parsed_tools->is_list()) {
+      error("도구 정의가 JSON 배열이 아닙니다.");
+      return;
+    }
+    auto payload = BuildInferencePayload(
+        provider, model, instructions, prompt, max_output_tokens, temperature,
+        tool_choice, parsed_tools->GetList());
+    if (!payload) {
+      error("지원하지 않는 모델 공급자입니다.");
+      return;
+    }
+    std::string body;
+    if (!base::JSONWriter::Write(*payload, &body)) {
+      error("모델 요청 JSON을 만들 수 없습니다.");
+      return;
+    }
+    auto request = std::make_unique<network::ResourceRequest>();
+    request->url = InferenceUrl(provider, endpoint);
+    request->method = "POST";
+    request->credentials_mode = network::mojom::CredentialsMode::kOmit;
+    const std::string& secret = credential->second.value;
+    if (method != "none") {
+      if (provider == "anthropic" && method == "api_key") {
+        request->headers.SetHeader("x-api-key", secret);
+      } else if (provider == "gemini" && method == "api_key") {
+        request->headers.SetHeader("x-goog-api-key", secret);
+      } else {
+        request->headers.SetHeader(net::HttpRequestHeaders::kAuthorization,
+                                   base::StrCat({"Bearer ", secret}));
+      }
+    }
+    if (provider == "anthropic") {
+      request->headers.SetHeader("anthropic-version", "2023-06-01");
+    }
+    StartInference(std::move(request), std::move(body),
+                   PendingInference{args[0].Clone(), provider, model});
+  }
+
+  void HandleModelCancel(const base::ListValue& args) {
+    if (args.size() != 1 || !args[0].is_string()) return;
+    auto result = InferenceResult("", "", "idle",
+                                  "실행 중인 모델 요청이 없습니다.");
+    if (pending_inference_) {
+      PendingInference cancelled = std::move(*pending_inference_);
+      pending_inference_.reset();
+      inference_loader_.reset();
+      Reply(cancelled.callback_id,
+            InferenceResult(cancelled.provider, cancelled.model, "cancelled",
+                            "사용자가 모델 요청을 취소했습니다."));
+      result = InferenceResult(cancelled.provider, cancelled.model,
+                               "cancelled", "모델 요청을 취소했습니다.");
+    }
+    Reply(args[0], std::move(result));
   }
 
   void BeginCredentialValidation(base::Value callback_id,
@@ -709,6 +1082,273 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     std::move(callback).Run(success, std::move(body));
   }
 
+  static void AppendText(std::string* output, std::string_view text) {
+    if (text.empty()) return;
+    if (!output->empty()) output->append("\n");
+    output->append(text);
+  }
+
+  static std::string ArgumentsString(const base::Value* value) {
+    return value && value->is_string() ? value->GetString() : JsonString(value);
+  }
+
+  static void AppendToolCall(base::ListValue* output,
+                             std::string_view id,
+                             std::string_view name,
+                             const base::Value* arguments) {
+    if (name.empty()) return;
+    base::DictValue call;
+    call.Set("id", id);
+    call.Set("name", name);
+    call.Set("arguments", ArgumentsString(arguments));
+    output->Append(std::move(call));
+  }
+
+  static int UsageInt(const base::DictValue* usage,
+                      std::initializer_list<std::string_view> names) {
+    if (!usage) return 0;
+    for (std::string_view name : names) {
+      if (auto value = usage->FindInt(name)) return *value;
+    }
+    return 0;
+  }
+
+  std::optional<base::DictValue> ParseInferenceResponse(
+      std::string_view provider,
+      std::string_view model,
+      std::string_view body) const {
+    auto parsed = base::JSONReader::Read(body, 0);
+    if (!parsed || !parsed->is_dict()) return std::nullopt;
+    const auto& root = parsed->GetDict();
+    std::string text;
+    std::string finish_reason;
+    base::ListValue tool_calls;
+    int input_tokens = 0;
+    int output_tokens = 0;
+    int total_tokens = 0;
+
+    if (provider == "openai") {
+      if (const auto* output = root.FindList("output")) {
+        for (const auto& item_value : *output) {
+          if (!item_value.is_dict()) continue;
+          const auto& item = item_value.GetDict();
+          const std::string* type = item.FindString("type");
+          if (type && *type == "message") {
+            if (const auto* content = item.FindList("content")) {
+              for (const auto& part_value : *content) {
+                if (!part_value.is_dict()) continue;
+                const auto& part = part_value.GetDict();
+                if (part.FindString("type") &&
+                    *part.FindString("type") == "output_text") {
+                  if (const std::string* value = part.FindString("text")) {
+                    AppendText(&text, *value);
+                  }
+                }
+              }
+            }
+          } else if (type && *type == "function_call") {
+            AppendToolCall(&tool_calls,
+                           item.FindString("call_id") ?
+                               *item.FindString("call_id") : "",
+                           item.FindString("name") ?
+                               *item.FindString("name") : "",
+                           item.Find("arguments"));
+          }
+        }
+      }
+      if (const std::string* status = root.FindString("status")) {
+        finish_reason = *status;
+      }
+      const auto* usage = root.FindDict("usage");
+      input_tokens = UsageInt(usage, {"input_tokens"});
+      output_tokens = UsageInt(usage, {"output_tokens"});
+      total_tokens = UsageInt(usage, {"total_tokens"});
+    } else if (provider == "anthropic") {
+      if (const auto* content = root.FindList("content")) {
+        for (const auto& part_value : *content) {
+          if (!part_value.is_dict()) continue;
+          const auto& part = part_value.GetDict();
+          const std::string* type = part.FindString("type");
+          if (type && *type == "text") {
+            if (const std::string* value = part.FindString("text")) {
+              AppendText(&text, *value);
+            }
+          } else if (type && *type == "tool_use") {
+            AppendToolCall(&tool_calls,
+                           part.FindString("id") ? *part.FindString("id") : "",
+                           part.FindString("name") ?
+                               *part.FindString("name") : "",
+                           part.Find("input"));
+          }
+        }
+      }
+      if (const std::string* reason = root.FindString("stop_reason")) {
+        finish_reason = *reason;
+      }
+      const auto* usage = root.FindDict("usage");
+      input_tokens = UsageInt(usage, {"input_tokens"});
+      output_tokens = UsageInt(usage, {"output_tokens"});
+      total_tokens = input_tokens + output_tokens;
+    } else if (provider == "gemini") {
+      const auto* candidates = root.FindList("candidates");
+      if (candidates && !candidates->empty() && (*candidates)[0].is_dict()) {
+        const auto& candidate = (*candidates)[0].GetDict();
+        if (const std::string* reason = candidate.FindString("finishReason")) {
+          finish_reason = *reason;
+        }
+        if (const auto* content = candidate.FindDict("content")) {
+          if (const auto* parts = content->FindList("parts")) {
+            for (const auto& part_value : *parts) {
+              if (!part_value.is_dict()) continue;
+              const auto& part = part_value.GetDict();
+              if (const std::string* value = part.FindString("text")) {
+                AppendText(&text, *value);
+              }
+              if (const auto* call = part.FindDict("functionCall")) {
+                AppendToolCall(&tool_calls, "",
+                               call->FindString("name") ?
+                                   *call->FindString("name") : "",
+                               call->Find("args"));
+              }
+            }
+          }
+        }
+      }
+      const auto* usage = root.FindDict("usageMetadata");
+      input_tokens = UsageInt(usage, {"promptTokenCount"});
+      output_tokens = UsageInt(usage, {"candidatesTokenCount"});
+      total_tokens = UsageInt(usage, {"totalTokenCount"});
+    } else if (provider == "ollama" || provider == "openrouter") {
+      const base::DictValue* message = nullptr;
+      const base::DictValue* usage = nullptr;
+      if (provider == "ollama") {
+        message = root.FindDict("message");
+        usage = &root;
+        if (const std::string* reason = root.FindString("done_reason")) {
+          finish_reason = *reason;
+        }
+        input_tokens = UsageInt(usage, {"prompt_eval_count"});
+        output_tokens = UsageInt(usage, {"eval_count"});
+        total_tokens = input_tokens + output_tokens;
+      } else {
+        const auto* choices = root.FindList("choices");
+        if (choices && !choices->empty() && (*choices)[0].is_dict()) {
+          const auto& choice = (*choices)[0].GetDict();
+          message = choice.FindDict("message");
+          if (const std::string* reason = choice.FindString("finish_reason")) {
+            finish_reason = *reason;
+          }
+        }
+        usage = root.FindDict("usage");
+        input_tokens = UsageInt(usage, {"prompt_tokens", "input_tokens"});
+        output_tokens = UsageInt(usage, {"completion_tokens", "output_tokens"});
+        total_tokens = UsageInt(usage, {"total_tokens"});
+      }
+      if (message) {
+        if (const std::string* value = message->FindString("content")) {
+          AppendText(&text, *value);
+        }
+        if (const auto* calls = message->FindList("tool_calls")) {
+          for (const auto& call_value : *calls) {
+            if (!call_value.is_dict()) continue;
+            const auto& call = call_value.GetDict();
+            const auto* function = call.FindDict("function");
+            if (!function) continue;
+            AppendToolCall(&tool_calls,
+                           call.FindString("id") ?
+                               *call.FindString("id") : "",
+                           function->FindString("name") ?
+                               *function->FindString("name") : "",
+                           function->Find("arguments"));
+          }
+        }
+      }
+    } else {
+      return std::nullopt;
+    }
+
+    auto result = InferenceResult(provider, model, "completed",
+                                  "모델 응답을 받았습니다.");
+    result.Set("text", std::move(text));
+    result.Set("tool_calls", std::move(tool_calls));
+    result.Set("finish_reason", std::move(finish_reason));
+    base::DictValue usage;
+    usage.Set("input_tokens", input_tokens);
+    usage.Set("output_tokens", output_tokens);
+    usage.Set("total_tokens", total_tokens > 0 ? total_tokens :
+                                                input_tokens + output_tokens);
+    result.Set("usage", std::move(usage));
+    return result;
+  }
+
+  void StartInference(std::unique_ptr<network::ResourceRequest> request,
+                      std::string upload_body,
+                      PendingInference pending) {
+    constexpr net::NetworkTrafficAnnotationTag traffic_annotation =
+        net::DefineNetworkTrafficAnnotation("meweb_model_inference", R"(
+          semantics {
+            sender: "MEWEB model inference adapter"
+            description:
+              "Sends a prompt to the AI model provider explicitly selected "
+              "and connected by the user, then normalizes the response."
+            trigger: "The user selects the model response test action."
+            data:
+              "The prompt, optional instructions and tool schemas entered or "
+              "approved by the user. Credentials stay in process memory."
+            destination: OTHER
+          }
+          policy {
+            cookies_allowed: NO
+            setting:
+              "The provider and connection can be selected or disconnected "
+              "from MEWEB AI model settings."
+            policy_exception_justification:
+              "This is a user-requested connection to a selected AI provider."
+          })");
+    pending_inference_ = std::move(pending);
+    inference_loader_ =
+        network::SimpleURLLoader::Create(std::move(request), traffic_annotation);
+    inference_loader_->AttachStringForUpload(std::move(upload_body),
+                                              "application/json");
+    inference_loader_->DownloadToString(
+        profile_->GetURLLoaderFactory().get(),
+        base::BindOnce(&MewebAgentWorkspaceHandler::OnInferenceFinished,
+                       weak_ptr_factory_.GetWeakPtr()),
+        kMaxMewebModelInferenceResponseBytes);
+  }
+
+  void OnInferenceFinished(std::optional<std::string> body) {
+    if (!pending_inference_) return;
+    PendingInference pending = std::move(*pending_inference_);
+    pending_inference_.reset();
+    const int network_error =
+        inference_loader_ ? inference_loader_->NetError() : net::ERR_FAILED;
+    int http_status = 0;
+    if (inference_loader_ && inference_loader_->ResponseInfo() &&
+        inference_loader_->ResponseInfo()->headers) {
+      http_status = inference_loader_->ResponseInfo()->headers->response_code();
+    }
+    inference_loader_.reset();
+    if (network_error != net::OK || http_status < 200 || http_status > 299 ||
+        !body) {
+      auto result = InferenceResult(
+          pending.provider, pending.model, "error",
+          network_error == net::OK ?
+              "모델 공급자가 요청을 거부했습니다." :
+              "모델 공급자 네트워크 요청에 실패했습니다.");
+      result.Set("http_status", http_status);
+      Reply(pending.callback_id, std::move(result));
+      return;
+    }
+    auto result = ParseInferenceResponse(pending.provider, pending.model, *body);
+    if (!result) {
+      Reply(pending.callback_id,
+            InferenceResult(pending.provider, pending.model, "error",
+                            "모델 공급자 응답 형식을 해석할 수 없습니다."));
+      return;
+    }
+    Reply(pending.callback_id, std::move(*result));
+  }
   void HandleSaveState(const base::ListValue& args) {
     if (args.size() == 1 && args[0].is_string()) {
       const std::string& serialized = args[0].GetString();
@@ -736,6 +1376,8 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
   raw_ptr<Profile> profile_;
   std::map<std::string, MemoryCredential> credentials_;
   std::unique_ptr<network::SimpleURLLoader> auth_loader_;
+  std::unique_ptr<network::SimpleURLLoader> inference_loader_;
+  std::optional<PendingInference> pending_inference_;
   base::WeakPtrFactory<MewebAgentWorkspaceHandler> weak_ptr_factory_{this};
 };
 

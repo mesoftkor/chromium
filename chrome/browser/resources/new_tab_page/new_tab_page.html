@@ -113,6 +113,8 @@
     .btn:hover { color:var(--accent); border-color:var(--accent); }
     .btn.primary { color:var(--accent-fg); border-color:var(--accent); background:var(--accent); font-weight:650; }
     .btn.danger { color:var(--danger); border-color:var(--danger); }
+    .btn:disabled { opacity:.45; cursor:not-allowed; }
+    .btn:disabled:hover { color:var(--muted); border-color:var(--line); }
     .view { flex:1; min-height:0; overflow:auto; }
     .start { padding:34px 32px 48px; }
     .start-inner { max-width:850px; margin:0 auto; }
@@ -144,6 +146,7 @@
     .text-input { width:100%; min-width:0; padding:8px 11px; color:var(--fg); background:var(--surface); border:1px solid var(--line); border-radius:8px; }
     .text-input:focus { outline:0; border-color:var(--accent); }
     .text-input:disabled { color:var(--dim); cursor:not-allowed; }
+    .model-prompt { min-height:76px; resize:vertical; font:inherit; line-height:1.5; }
     .start-grid { display:grid; grid-template-columns:1.25fr 1fr; gap:24px; margin-top:28px; }
     .section-title { margin:0 0 10px; color:var(--dim); font-size:.75em; letter-spacing:.08em; text-transform:uppercase; }
     .task-card { width:100%; padding:var(--card-padding); margin-bottom:9px; text-align:left; background:var(--surface-2); border:1px solid var(--line-soft); border-radius:10px; }

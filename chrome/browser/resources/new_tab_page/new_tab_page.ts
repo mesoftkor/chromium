@@ -144,7 +144,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
   const MODEL_PROFILES = {
     'openai/gpt-4o-mini': {
       provider: 'openai', providerLabel: 'OpenAI', name: 'gpt-4o-mini',
-      endpoint: 'https://api.openai.com/v1/chat/completions',
+      endpoint: 'https://api.openai.com/v1/responses',
       temperature: 0.2, maxContextTokens: 4096, maxOutputTokens: 4096,
       credentialReference: 'OPENAI_API_KEY', toolFormat: 'tools',
       defaultAuthenticationMethod: 'oauth_wif',
@@ -152,17 +152,17 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     },
     'openai/gpt-4.1': {
       provider: 'openai', providerLabel: 'OpenAI', name: 'gpt-4.1',
-      endpoint: 'https://api.openai.com/v1/chat/completions',
+      endpoint: 'https://api.openai.com/v1/responses',
       temperature: 0.1, maxContextTokens: 8192, maxOutputTokens: 4096,
       credentialReference: 'OPENAI_API_KEY', toolFormat: 'tools',
       defaultAuthenticationMethod: 'oauth_wif',
       allowedAuthenticationMethods: ['oauth_wif', 'api_key'],
     },
-    'anthropic/claude-3-5-sonnet': {
+    'anthropic/claude-sonnet-4-6': {
       provider: 'anthropic', providerLabel: 'Anthropic',
-      name: 'claude-3-5-sonnet-20241022',
+      name: 'claude-sonnet-4-6',
       endpoint: 'https://api.anthropic.com/v1/messages',
-      temperature: 0.2, maxContextTokens: 200000, maxOutputTokens: 4096,
+      temperature: 0.2, maxContextTokens: 1000000, maxOutputTokens: 4096,
       credentialReference: 'ANTHROPIC_API_KEY', toolFormat: 'tool_use',
       defaultAuthenticationMethod: 'cli_oauth',
       allowedAuthenticationMethods: ['cli_oauth', 'oauth_wif', 'api_key'],
@@ -178,7 +178,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     },
     'ollama/qwen2.5-14b': {
       provider: 'ollama', providerLabel: 'Ollama Local', name: 'qwen2.5-14b',
-      endpoint: 'http://127.0.0.1:11434/v1/chat/completions',
+      endpoint: 'http://127.0.0.1:11434/api/chat',
       temperature: 0.2, maxContextTokens: 32768, maxOutputTokens: 4096,
       credentialReference: null, toolFormat: 'json_mode',
       defaultAuthenticationMethod: 'none',
@@ -204,6 +204,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
   };
   const MODEL_PROFILE_IDS = Object.keys(MODEL_PROFILES);
   const LEGACY_MODEL_PROFILE_IDS = {
+    'anthropic/claude-3-5-sonnet': 'anthropic/claude-sonnet-4-6',
     'google/gemini-1-5-pro': 'gemini/gemini-3.6-flash',
     'local/qwen2.5-14b': 'ollama/qwen2.5-14b',
   };
@@ -523,6 +524,13 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     key: '', status: 'unknown', connected: false,
     message: '연결 상태를 확인하지 않았습니다.',
   };
+  let modelInference = {
+    key: '', status: 'idle', completed: false,
+    message: '아직 모델 응답 시험을 실행하지 않았습니다.',
+    text: '', tool_calls: [],
+    usage: {input_tokens: 0, output_tokens: 0, total_tokens: 0},
+  };
+  let modelTestPrompt = 'MEWEB 모델 연결 시험입니다. 한 문장으로 응답하세요.';
   let currentView = 'start';
   let settingsSection = 'agent';
   let engineMenuOpen = false;
@@ -706,7 +714,8 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       setHtml(content, `<h1>시작 화면</h1><p class="lede">새 탭에서 보여줄 정보를 선택합니다.</p><section class="settings-card"><h2>구성</h2>${row('바로가기 표시', '직접 추가하고 삭제한 링크가 프로필에 저장됩니다.', `<button class="toggle" id="showLinksToggle" aria-pressed="${state.start.showLinks}"></button>`)}${row('진행 중인 작업 표시', '', `<button class="toggle" id="showTasksToggle" aria-pressed="${state.start.showTasks}"></button>`)}${row('저장된 바로가기', '', `<span class="value">${state.start.links.length}개</span>`)}</section>`);
     } else if (settingsSection === 'models') {
       const selectedProfile = modelProfile();
-      const endpointEditable = selectedProfile.provider === 'local';
+      const endpointEditable = selectedProfile.provider === 'ollama' &&
+          selectedProfile.allowedAuthenticationMethods.includes('none');
       const authentication = MODEL_AUTHENTICATION[selectedProfile.provider];
       const authenticationMethod =
           authentication.methods[state.model.authenticationMethod];
@@ -734,6 +743,20 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
             status: 'unknown', connected: false,
             message: '연결 상태를 확인하지 않았습니다.',
           };
+      const displayedInference = modelInference.key === authKey ?
+          modelInference : {
+            status: 'idle', completed: false,
+            message: '현재 공급자에서 모델 응답 시험을 실행하지 않았습니다.',
+            text: '', tool_calls: [],
+            usage: {input_tokens: 0, output_tokens: 0, total_tokens: 0},
+          };
+      const inferencePreview = JSON.stringify({
+        status: displayedInference.status,
+        text: displayedInference.text || '',
+        tool_calls: displayedInference.tool_calls || [],
+        finish_reason: displayedInference.finish_reason || '',
+        usage: displayedInference.usage,
+      }, null, 2);
       const needsCredentialInput = !['none', 'oauth_wif'].includes(
           state.model.authenticationMethod);
       const credentialPlaceholder = state.model.authenticationMethod ===
@@ -757,6 +780,11 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
           <div class="setting-row"><div class="note"><b>${esc(authenticationMethod.label)} · 비밀값은 Chromium Preferences와 localStorage에 저장하지 않습니다.</b><br>${esc(authenticationHelp)}</div></div>
           ${row('네이티브 연결', 'Python 없이 Chromium C++23 브로커가 검증합니다.', `<div class="setting-control">${needsCredentialInput ? `<input class="text-input" type="password" id="modelCredentialInput" maxlength="16384" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="${esc(credentialPlaceholder)}">` : ''}<button class="btn primary" id="connectModelProviderButton">연결</button><button class="btn" id="checkModelProviderButton">상태 확인</button><button class="btn" id="disconnectModelProviderButton" ${displayedAuthStatus.connected ? '' : 'disabled'}>연결 해제</button></div>`)}
           <div class="setting-row"><div class="validation ${displayedAuthStatus.status === 'error' ? 'error' : ''}" id="modelAuthStatus" data-status="${esc(displayedAuthStatus.status)}">${esc(displayedAuthStatus.message)}</div></div>
+        </section>
+        <section class="settings-card"><h2>실제 모델 응답 시험</h2>
+          ${row('시험 프롬프트', '입력과 응답은 프로필 설정에 저장하지 않습니다.', `<div class="setting-control"><textarea class="text-input model-prompt" id="modelTestPromptInput" maxlength="65536" rows="3" spellcheck="false">${esc(modelTestPrompt)}</textarea></div>`)}
+          <div class="setting-row"><div class="setting-control"><button class="btn primary" id="testModelResponseButton" ${displayedAuthStatus.connected && displayedInference.status !== 'running' ? '' : 'disabled'}>응답 보내기</button><button class="btn" id="cancelModelResponseButton" ${displayedInference.status === 'running' ? '' : 'disabled'}>요청 취소</button></div><div class="validation ${displayedInference.status === 'error' ? 'error' : ''}" id="modelInferenceStatus" data-status="${esc(displayedInference.status)}">${esc(displayedInference.message)}</div></div>
+          <div class="setting-row"><pre class="code-preview" id="modelInferenceResult">${esc(inferencePreview)}</pre></div>
         </section>
         <section class="settings-card"><h2>생성·도구 설정</h2>
           ${row('온도', '결정적인 브라우저 조작을 위해 0.1~0.3을 권장합니다.', `<div class="setting-control"><input type="range" id="modelTemperatureInput" min="0" max="1" step="0.1" value="${state.model.temperature}"><span class="value" id="modelTemperatureValue">${state.model.temperature.toFixed(1)}</span></div>`)}
@@ -1056,6 +1084,71 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     }
   }
 
+  async function generateModelResponse(promptOverride, tools = []) {
+    const selected = selectedAuthentication();
+    const runtime = effectiveModelRuntime();
+    const promptInput = $('#modelTestPromptInput');
+    const candidatePrompt = promptOverride === undefined ?
+        promptInput?.value : promptOverride;
+    const prompt = String(candidatePrompt || '').trim();
+    if (!prompt || prompt.length > 65536) {
+      modelInference = {
+        key: selected.key, status: 'error', completed: false,
+        message: '시험 프롬프트는 1~65,536자여야 합니다.', text: '',
+        tool_calls: [],
+        usage: {input_tokens: 0, output_tokens: 0, total_tokens: 0},
+      };
+      renderSettings();
+      return modelInference;
+    }
+    modelTestPrompt = prompt;
+    modelInference = {
+      key: selected.key, status: 'running', completed: false,
+      message: `${runtime.selected_model.provider} 모델에 요청하고 있습니다.`,
+      text: '', tool_calls: [],
+      usage: {input_tokens: 0, output_tokens: 0, total_tokens: 0},
+    };
+    renderSettings();
+    try {
+      const result = await sendModelAuthRequest(
+          'mewebModelGenerate', runtime.selected_model.provider,
+          runtime.selected_model.authentication.method,
+          runtime.selected_model.endpoint, runtime.selected_model.name,
+          'MEWEB 연결 시험입니다. 안전 정책을 지키고 간결하게 응답하세요.',
+          prompt, runtime.selected_model.max_output_tokens,
+          runtime.selected_model.temperature, runtime.selected_model.tool_choice,
+          JSON.stringify(Array.isArray(tools) ? tools : []));
+      modelInference = {...result, key: selected.key};
+      renderSettings();
+      if (result?.completed) {
+        record(`AI 모델의 실제 응답을 확인했습니다: ${selected.key}`);
+        toast('모델 응답을 확인했습니다.');
+      } else if (result?.status !== 'cancelled') {
+        toast('모델 응답 시험을 완료하지 못했습니다.');
+      }
+      return result;
+    } catch (_error) {
+      modelInference = {
+        key: selected.key, status: 'error', completed: false,
+        message: '네이티브 추론 어댑터 호출에 실패했습니다.', text: '',
+        tool_calls: [],
+        usage: {input_tokens: 0, output_tokens: 0, total_tokens: 0},
+      };
+      renderSettings();
+      return modelInference;
+    }
+  }
+
+  async function cancelModelResponse() {
+    const result = await sendModelAuthRequest('mewebModelCancel');
+    if (result?.status === 'cancelled') {
+      modelInference = {...result, key: selectedAuthentication().key};
+      renderSettings();
+      toast('모델 요청을 취소했습니다.');
+    }
+    return result;
+  }
+
   document.addEventListener('click', event => {
     const removeLinkTarget = event.target.closest('[data-remove-link]');
     if (removeLinkTarget) {
@@ -1118,6 +1211,8 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       case 'connectModelProviderButton': connectModelProvider(); break;
       case 'checkModelProviderButton': checkModelProviderConnection(); break;
       case 'disconnectModelProviderButton': disconnectModelProvider(); break;
+      case 'testModelResponseButton': generateModelResponse(); break;
+      case 'cancelModelResponseButton': cancelModelResponse(); break;
       case 'openChromeSettingsButton': window.location.assign('chrome://settings/'); break;
       case 'openUpdateSettingsButton': window.location.assign('chrome://settings/help'); break;
     }
@@ -1130,6 +1225,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     if (event.target.id === 'hourInput') { state.adaptive.hour = Number(event.target.value); save(); $('#hourValue').textContent = HOURS[state.adaptive.hour]; renderStart(); }
     if (event.target.id === 'modelTemperatureInput') { $('#modelTemperatureValue').textContent = Number(event.target.value).toFixed(1); }
     if (event.target.id === 'modelRetryInput') { $('#modelRetryValue').textContent = `${event.target.value}회`; }
+    if (event.target.id === 'modelTestPromptInput') { modelTestPrompt = event.target.value; }
   });
 
   document.addEventListener('keydown', event => {
@@ -1166,6 +1262,10 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     },
     checkModelProviderConnection: () => checkModelProviderConnection(),
     disconnectModelProvider: () => disconnectModelProvider(),
+    generateModelResponse: (prompt, tools = []) =>
+      generateModelResponse(prompt, tools),
+    cancelModelResponse: () => cancelModelResponse(),
+    getModelInference: () => JSON.parse(JSON.stringify(modelInference)),
     validateModelSettings: value => JSON.parse(JSON.stringify(validateModelSettings(value))),
     setModelProfile: value => selectModelProfile(value),
     importModelSettings: value => {
