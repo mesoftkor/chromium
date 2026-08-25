@@ -650,7 +650,7 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
             declaration.Set("description", *description);
           }
           const base::Value* parameters = tool.Find("parameters");
-          declaration.Set("parameters",
+          declaration.Set("parametersJsonSchema",
                           parameters && parameters->is_dict()
                               ? parameters->Clone()
                               : base::Value(base::DictValue()));
