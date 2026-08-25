@@ -56,7 +56,7 @@
         "Apple SD Gothic Neo", "Pretendard", "Segoe UI", sans-serif;
       -webkit-font-smoothing: antialiased;
     }
-    button, input { color: inherit; font: inherit; }
+    button, input, select { color: inherit; font: inherit; }
     button { border: 0; background: none; cursor: pointer; }
     [hidden] { display: none !important; }
     :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -89,6 +89,7 @@
     .autonomy.always { color:var(--info); background:#8b9bf922; }
     .autonomy.risky { color:var(--warn); background:#e8ab3f22; }
     .autonomy.auto { color:var(--accent); background:var(--accent-soft); }
+    .model-chip { display:block; margin-top:5px; padding:3px 8px; color:var(--accent); text-align:center; border:1px solid var(--line-soft); border-radius:6px; font-size:.72em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .rail-section h2 { margin:0 5px 7px; color:var(--dim); font-size:.73em; letter-spacing:.09em; text-transform:uppercase; }
     .rail-nav { display:flex; flex-direction:column; gap:3px; }
     .rail-item {
@@ -142,6 +143,7 @@
     .link-form { display:grid; grid-template-columns:1fr 1.6fr auto auto; gap:7px; margin-top:10px; }
     .text-input { width:100%; min-width:0; padding:8px 11px; color:var(--fg); background:var(--surface); border:1px solid var(--line); border-radius:8px; }
     .text-input:focus { outline:0; border-color:var(--accent); }
+    .text-input:disabled { color:var(--dim); cursor:not-allowed; }
     .start-grid { display:grid; grid-template-columns:1.25fr 1fr; gap:24px; margin-top:28px; }
     .section-title { margin:0 0 10px; color:var(--dim); font-size:.75em; letter-spacing:.08em; text-transform:uppercase; }
     .task-card { width:100%; padding:var(--card-padding); margin-bottom:9px; text-align:left; background:var(--surface-2); border:1px solid var(--line-soft); border-radius:10px; }
@@ -221,6 +223,15 @@
     .list-row .delete { color:var(--dim); }
     .list-row .delete:hover { color:var(--danger); }
     .add-row { width:100%; display:flex; gap:7px; }
+    .model-grid { width:100%; display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:8px; }
+    .model-card { min-width:0; padding:11px 12px; color:var(--muted); text-align:left; border:1px solid var(--line); border-radius:9px; background:var(--surface); }
+    .model-card:hover { border-color:var(--accent); }
+    .model-card[aria-pressed="true"] { color:var(--fg); border-color:var(--accent); background:var(--accent-soft); }
+    .model-card b, .model-card small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .model-card small { margin-top:3px; color:var(--dim); }
+    .code-preview { width:100%; max-height:260px; margin:0; padding:12px; overflow:auto; color:var(--muted); border:1px solid var(--line-soft); border-radius:8px; background:var(--surface); font: .76em/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+    .validation { width:100%; color:var(--accent); font-size:.8em; }
+    .validation.error { color:var(--danger); }
     .stub { padding:36px 22px; color:var(--dim); text-align:center; border:1px dashed var(--line); border-radius:11px; background:var(--surface-2); }
     .audit { position:absolute; z-index:30; inset:48px 0 0 auto; width:min(390px,45vw); padding:20px; overflow:auto; background:var(--surface); border-left:1px solid var(--line); box-shadow:-16px 0 36px #0005; }
     .audit-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:15px; }
@@ -242,7 +253,7 @@
   </style>
 </head>
 <body>
-  <div id="mewebAgentWorkspace" data-meweb-phase="6">
+  <div id="mewebAgentWorkspace" data-meweb-phase="6" data-agent-model-settings="1">
     <aside class="rail" aria-label="MEWEB 작업 레일">
       <div class="brand-row"><span class="brand">ME<b>WEB</b></span><button class="icon-btn" id="resetButton" title="초기화">↺</button></div>
       <div>
@@ -251,6 +262,7 @@
           <span class="profile-meta"><span class="profile-name" id="profileName">미웹</span><span class="profile-role" id="profileRole">정산·회계 담당</span></span>
         </button>
         <span class="autonomy risky" id="autonomyChip">위험 단계만 승인</span>
+        <span class="model-chip" id="modelChip">OpenAI · gpt-4o-mini</span>
       </div>
       <section class="rail-section">
         <h2>워크스페이스</h2>
@@ -316,6 +328,7 @@
           <button data-settings-target="search">검색엔진</button>
           <button data-settings-target="startup">시작 화면</button>
           <button data-settings-target="agent" aria-current="page">에이전트</button>
+          <button data-settings-target="models">AI 모델</button>
           <button data-settings-target="privacy">개인정보 보호</button>
           <button data-settings-target="downloads">다운로드</button>
           <button data-settings-target="updates">업데이트·복구</button>

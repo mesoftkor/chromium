@@ -127,6 +127,207 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     risky: {label: '위험 단계만 승인', className: 'risky', note: '외부 전송과 로컬 저장처럼 영향을 남기는 단계에서만 승인받습니다.', reason: '되돌리기 어려운 단계이므로 실행 전에 멈췄습니다.'},
     auto: {label: '자동 진행', className: 'auto', note: '모든 단계를 자동 실행하되 기록과 되돌리기를 제공합니다.', reason: '자동 진행 설정에 따라 승인 없이 실행했습니다.'},
   };
+  const MODEL_PROFILES = {
+    'openai/gpt-4o-mini': {
+      provider: 'openai', providerLabel: 'OpenAI', name: 'gpt-4o-mini',
+      endpoint: 'https://api.openai.com/v1/chat/completions',
+      temperature: 0.2, maxContextTokens: 4096, maxOutputTokens: 4096,
+      credentialReference: 'OPENAI_API_KEY', toolFormat: 'tools',
+    },
+    'openai/gpt-4.1': {
+      provider: 'openai', providerLabel: 'OpenAI', name: 'gpt-4.1',
+      endpoint: 'https://api.openai.com/v1/chat/completions',
+      temperature: 0.1, maxContextTokens: 8192, maxOutputTokens: 4096,
+      credentialReference: 'OPENAI_API_KEY', toolFormat: 'tools',
+    },
+    'anthropic/claude-3-5-sonnet': {
+      provider: 'anthropic', providerLabel: 'Anthropic',
+      name: 'claude-3-5-sonnet-20241022',
+      endpoint: 'https://api.anthropic.com/v1/messages',
+      temperature: 0.2, maxContextTokens: 200000, maxOutputTokens: 4096,
+      credentialReference: 'ANTHROPIC_API_KEY', toolFormat: 'tool_use',
+    },
+    'google/gemini-1-5-pro': {
+      provider: 'google', providerLabel: 'Google', name: 'gemini-1.5-pro',
+      endpoint: 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent',
+      temperature: 0.2, maxContextTokens: 1000000, maxOutputTokens: 4096,
+      credentialReference: 'GEMINI_API_KEY',
+      toolFormat: 'functionDeclarations',
+    },
+    'local/qwen2.5-14b': {
+      provider: 'local', providerLabel: 'Local LLM', name: 'qwen2.5-14b',
+      endpoint: 'http://127.0.0.1:11434/v1/chat/completions',
+      temperature: 0.2, maxContextTokens: 32768, maxOutputTokens: 4096,
+      credentialReference: null, toolFormat: 'json_mode',
+    },
+  };
+  const MODEL_PROFILE_IDS = Object.keys(MODEL_PROFILES);
+  const MODEL_TOOL_CHOICES = ['required', 'auto', 'none'];
+  const MODEL_SELECTOR_PROFILES = ['naver-desktop-v1', 'naver-mobile-v1'];
+  const MODEL_FAIL_POLICIES = [
+    'ask_human', 'retry_once_then_ask', 'strict_stop'];
+  const SECRET_FIELD_SUFFIXES = [
+    'apikey', 'accesstoken', 'refreshtoken', 'clientsecret',
+    'password', 'authorization',
+  ];
+
+  function isSecretFieldName(value) {
+    const normalized = String(value).replace(/[^a-z0-9]/gi, '').toLowerCase();
+    return normalized === 'secret' ||
+        SECRET_FIELD_SUFFIXES.some(suffix => normalized.endsWith(suffix));
+  }
+
+  function isLoopbackEndpoint(value) {
+    try {
+      const url = new URL(String(value));
+      const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+      return ['http:', 'https:'].includes(url.protocol) &&
+          ['127.0.0.1', 'localhost', '::1'].includes(host) &&
+          !url.username && !url.password;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function containsSecretField(value) {
+    if (!value || typeof value !== 'object') return false;
+    return Object.entries(value).some(([key, child]) =>
+      isSecretFieldName(key) || containsSecretField(child));
+  }
+
+  function modelDefaults(profileId = 'openai/gpt-4o-mini') {
+    const selected = MODEL_PROFILES[profileId] ? profileId : MODEL_PROFILE_IDS[0];
+    const profile = MODEL_PROFILES[selected];
+    return {
+      selected,
+      endpoint: profile.endpoint,
+      temperature: profile.temperature,
+      maxOutputTokens: profile.maxOutputTokens,
+      toolChoice: 'auto',
+      selectorProfile: 'naver-desktop-v1',
+      failPolicy: 'ask_human',
+      retryLimit: 2,
+      requireHumanPublishApproval: true,
+    };
+  }
+
+  function sanitizeModelSettings(candidate) {
+    const source = candidate && typeof candidate === 'object' ? candidate : {};
+    const selected = MODEL_PROFILES[source.selected] ?
+        source.selected : 'openai/gpt-4o-mini';
+    const profile = MODEL_PROFILES[selected];
+    const defaultsForProfile = modelDefaults(selected);
+    const temperature = Number(source.temperature);
+    const maxOutputTokens = Number(source.maxOutputTokens);
+    const retryLimit = Number(source.retryLimit);
+    return {
+      selected,
+      endpoint: profile.provider === 'local' &&
+              isLoopbackEndpoint(source.endpoint) ?
+          String(source.endpoint) : profile.endpoint,
+      temperature: Number.isFinite(temperature) &&
+              temperature >= 0 && temperature <= 1 ?
+          temperature : defaultsForProfile.temperature,
+      maxOutputTokens: Number.isInteger(maxOutputTokens) &&
+              maxOutputTokens >= 256 &&
+              maxOutputTokens <= profile.maxContextTokens ?
+          maxOutputTokens : defaultsForProfile.maxOutputTokens,
+      toolChoice: MODEL_TOOL_CHOICES.includes(source.toolChoice) ?
+          source.toolChoice : defaultsForProfile.toolChoice,
+      selectorProfile:
+          MODEL_SELECTOR_PROFILES.includes(source.selectorProfile) ?
+          source.selectorProfile : defaultsForProfile.selectorProfile,
+      failPolicy: MODEL_FAIL_POLICIES.includes(source.failPolicy) ?
+          source.failPolicy : defaultsForProfile.failPolicy,
+      retryLimit: Number.isInteger(retryLimit) &&
+              retryLimit >= 0 && retryLimit <= 5 ?
+          retryLimit : defaultsForProfile.retryLimit,
+      requireHumanPublishApproval: true,
+    };
+  }
+
+  function validateModelSettings(candidate) {
+    const errors = [];
+    if (!candidate || typeof candidate !== 'object') {
+      return {valid: false, errors: ['모델 설정이 객체가 아닙니다.']};
+    }
+    if (containsSecretField(candidate)) {
+      errors.push('API 키·토큰·비밀번호는 모델 설정에 저장할 수 없습니다.');
+    }
+    const profile = MODEL_PROFILES[candidate.selected];
+    if (!profile) errors.push('지원하지 않는 모델 프로필입니다.');
+    if (profile) {
+      if (profile.provider === 'local') {
+        if (!isLoopbackEndpoint(candidate.endpoint)) {
+          errors.push('로컬 모델 주소는 localhost 또는 loopback만 허용합니다.');
+        }
+      } else if (candidate.endpoint !== profile.endpoint) {
+        errors.push('클라우드 모델 주소는 검증된 기본 주소만 허용합니다.');
+      }
+      const outputTokens = Number(candidate.maxOutputTokens);
+      if (!Number.isInteger(outputTokens) || outputTokens < 256 ||
+          outputTokens > profile.maxContextTokens) {
+        errors.push(`출력 토큰은 256~${profile.maxContextTokens} 범위여야 합니다.`);
+      }
+    }
+    const temperature = Number(candidate.temperature);
+    if (!Number.isFinite(temperature) || temperature < 0 || temperature > 1) {
+      errors.push('온도는 0~1 범위여야 합니다.');
+    }
+    if (!MODEL_TOOL_CHOICES.includes(candidate.toolChoice)) {
+      errors.push('도구 호출 정책이 올바르지 않습니다.');
+    }
+    if (!MODEL_SELECTOR_PROFILES.includes(candidate.selectorProfile)) {
+      errors.push('UI 셀렉터 프로필이 올바르지 않습니다.');
+    }
+    if (!MODEL_FAIL_POLICIES.includes(candidate.failPolicy)) {
+      errors.push('실패 정책이 올바르지 않습니다.');
+    }
+    const retryLimit = Number(candidate.retryLimit);
+    if (!Number.isInteger(retryLimit) || retryLimit < 0 || retryLimit > 5) {
+      errors.push('동작별 재시도 횟수는 0~5 범위여야 합니다.');
+    }
+    if (candidate.requireHumanPublishApproval !== true) {
+      errors.push('발행 전 사용자 승인 보호는 끌 수 없습니다.');
+    }
+    return {valid: errors.length === 0, errors};
+  }
+
+  function effectiveModelRuntime(candidate = state?.model) {
+    const settings = sanitizeModelSettings(candidate);
+    const profile = MODEL_PROFILES[settings.selected];
+    return {
+      schema_version: 'meweb-agent-model-runtime-v1',
+      selected_model: {
+        id: settings.selected,
+        provider: profile.provider,
+        name: profile.name,
+        endpoint: settings.endpoint,
+        temperature: settings.temperature,
+        max_context_tokens: profile.maxContextTokens,
+        max_output_tokens: settings.maxOutputTokens,
+        tool_choice: settings.toolChoice,
+        tool_format: profile.toolFormat,
+        credential_reference: profile.credentialReference,
+      },
+      selected_selector_profile: settings.selectorProfile,
+      runtime: {
+        fail_policy: settings.failPolicy,
+        retry_limit_per_action: settings.retryLimit,
+        require_human_publish_approval: true,
+      },
+      prompt: {
+        document: 'docs/agent-browser-system-prompt.md',
+        model_agnostic: true,
+      },
+      security: {
+        credentials_persisted: false,
+        cloud_endpoints_locked: true,
+        local_endpoint_loopback_only: true,
+        publish_click_guard: true,
+      },
+    };
+  }
 
   function defaults() {
     return {
@@ -134,6 +335,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       persona: {avatar: 'ribbon', name: '미웹', domain: 'finance', tone: 'standard', autonomy: 'risky', showReason: true},
       workflow: {custom: [], pinned: ['이월 항목 대사', '월마감 체크리스트'], removed: [], shortcuts: true},
       adaptive: {enabled: true, basis: 'time', hour: 0, forgotten: []},
+      model: modelDefaults(),
       start: {engine: 'google', showLinks: true, showTasks: true, links: [
         {name: '정산 문서', url: 'https://docs.mesoft.kr', color: '#7ee0c0'},
         {name: '거래명세서', url: 'https://files.mesoft.kr', color: '#e8ab3f'},
@@ -157,6 +359,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       for (const key of Object.keys(base)) {
         if (parsed[key] && typeof parsed[key] === 'object') Object.assign(base[key], parsed[key]);
       }
+      base.model = sanitizeModelSettings(parsed.model);
       if (!Array.isArray(base.task.audit)) base.task.audit = [];
       if (!base.task.decisions || typeof base.task.decisions !== 'object') base.task.decisions = {};
     } catch (_error) {}
@@ -171,6 +374,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
   let toastTimer = 0;
 
   function save() {
+    state.model = sanitizeModelSettings(state.model);
     const serialized = JSON.stringify(state);
     localStorage.setItem(STORAGE_KEY, serialized);
     // eslint-disable-next-line no-restricted-properties
@@ -186,6 +390,9 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
   function engine() { return ENGINES.find(item => item.id === state.start.engine) || ENGINES[0]; }
   function domain() { return DOMAINS[state.persona.domain] || DOMAINS.finance; }
   function autonomy() { return AUTONOMY[state.persona.autonomy] || AUTONOMY.risky; }
+  function modelProfile() {
+    return MODEL_PROFILES[state.model.selected] || MODEL_PROFILES[MODEL_PROFILE_IDS[0]];
+  }
   function toast(message) {
     const element = $('#toast');
     element.textContent = message;
@@ -250,6 +457,8 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     const chip = $('#autonomyChip');
     chip.textContent = autonomy().label;
     chip.className = `autonomy ${autonomy().className}`;
+    $('#modelChip').textContent =
+        `${modelProfile().providerLabel} · ${modelProfile().name}`;
   }
 
   function renderNavigation() {
@@ -262,7 +471,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     const crumbs = {
       start: '<b>시작 화면</b> · 검색, 바로가기와 진행 중인 작업',
       work: `<b>${esc(state.task.name)}</b> · 승인 기반 에이전트 워크스페이스`,
-      settings: `<b>환경설정</b> · ${esc({appearance:'모양', search:'검색엔진', startup:'시작 화면', agent:'에이전트', privacy:'개인정보 보호', downloads:'다운로드', updates:'업데이트·복구'}[settingsSection])}`,
+      settings: `<b>환경설정</b> · ${esc({appearance:'모양', search:'검색엔진', startup:'시작 화면', agent:'에이전트', models:'AI 모델', privacy:'개인정보 보호', downloads:'다운로드', updates:'업데이트·복구'}[settingsSection])}`,
     };
     setHtml($('#crumb'), crumbs[currentView]);
     $('#auditPanel').hidden = !auditOpen || currentView !== 'work';
@@ -339,6 +548,32 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       setHtml(content, `<h1>검색엔진</h1><p class="lede">시작 화면 검색에 사용할 서비스를 선택합니다.</p><section class="settings-card"><h2>기본 검색엔진</h2>${ENGINES.map(item => row(`<span style="color:${item.color};font-weight:700">●</span> ${esc(item.name)}`, item.host, item.id === state.start.engine ? '<span class="value">기본</span>' : `<button class="btn" data-engine="${item.id}">기본으로 설정</button>`)).join('')}</section>`);
     } else if (settingsSection === 'startup') {
       setHtml(content, `<h1>시작 화면</h1><p class="lede">새 탭에서 보여줄 정보를 선택합니다.</p><section class="settings-card"><h2>구성</h2>${row('바로가기 표시', '직접 추가하고 삭제한 링크가 프로필에 저장됩니다.', `<button class="toggle" id="showLinksToggle" aria-pressed="${state.start.showLinks}"></button>`)}${row('진행 중인 작업 표시', '', `<button class="toggle" id="showTasksToggle" aria-pressed="${state.start.showTasks}"></button>`)}${row('저장된 바로가기', '', `<span class="value">${state.start.links.length}개</span>`)}</section>`);
+    } else if (settingsSection === 'models') {
+      const selectedProfile = modelProfile();
+      const endpointEditable = selectedProfile.provider === 'local';
+      const runtimePreview = JSON.stringify(effectiveModelRuntime(), null, 2);
+      setHtml(content, `<h1>AI 모델</h1><p class="lede">모델 공급자를 바꿔도 같은 시스템 프롬프트와 안전 정책을 사용합니다.</p>
+        <section class="settings-card"><h2>모델 프로필</h2>
+          <div class="setting-row"><div class="model-grid">${MODEL_PROFILE_IDS.map(id => {
+            const profile = MODEL_PROFILES[id];
+            return `<button class="model-card" data-model-profile="${esc(id)}" aria-pressed="${id === state.model.selected}"><b>${esc(profile.providerLabel)} · ${esc(profile.name)}</b><small>컨텍스트 ${profile.maxContextTokens.toLocaleString()} · ${esc(profile.toolFormat)}</small></button>`;
+          }).join('')}</div></div>
+          ${row('API 주소', endpointEditable ? '로컬 모델은 localhost 또는 loopback 주소만 허용합니다.' : '클라우드 공급자의 검증된 기본 주소로 잠겨 있습니다.', `<div class="setting-control"><input class="text-input" id="modelEndpointInput" maxlength="300" value="${esc(state.model.endpoint)}" ${endpointEditable ? '' : 'disabled'}></div>`)}
+          <div class="setting-row"><div class="note"><b>API 키는 이 화면에 입력하거나 저장하지 않습니다.</b><br>${selectedProfile.credentialReference ? `${esc(selectedProfile.credentialReference)}를 OS Keychain 또는 실행 환경에서 런타임이 읽습니다.` : '로컬 모델은 기본적으로 별도 키가 필요하지 않습니다.'}</div></div>
+        </section>
+        <section class="settings-card"><h2>생성·도구 설정</h2>
+          ${row('온도', '결정적인 브라우저 조작을 위해 0.1~0.3을 권장합니다.', `<div class="setting-control"><input type="range" id="modelTemperatureInput" min="0" max="1" step="0.1" value="${state.model.temperature}"><span class="value" id="modelTemperatureValue">${state.model.temperature.toFixed(1)}</span></div>`)}
+          ${row('최대 출력 토큰', `선택 모델 컨텍스트 한도 ${selectedProfile.maxContextTokens.toLocaleString()} 안에서 설정합니다.`, `<div class="setting-control"><input class="text-input" type="number" id="modelOutputTokensInput" min="256" max="${selectedProfile.maxContextTokens}" step="256" value="${state.model.maxOutputTokens}"></div>`)}
+          ${row('도구 호출', 'required는 도구 사용 강제, auto는 모델 판단, none은 텍스트 전용입니다.', optionGroup('model.toolChoice', [['required','required','필수'],['auto','auto','자동'],['none','none','사용 안 함']]))}
+          ${row('UI 셀렉터', '네이버 데스크톱과 모바일 프로필을 분리합니다.', optionGroup('model.selectorProfile', [['naver-desktop-v1','naver-desktop-v1','데스크톱'],['naver-mobile-v1','naver-mobile-v1','모바일']]))}
+        </section>
+        <section class="settings-card"><h2>실패·승인 정책</h2>
+          ${row('실패 정책', '모르는 상태를 추측하지 않고 사용자에게 넘기는 방식을 결정합니다.', optionGroup('model.failPolicy', [['ask_human','ask_human','사용자 확인'],['retry_once_then_ask','retry_once_then_ask','1회 재시도'],['strict_stop','strict_stop','즉시 중단']]))}
+          ${row('동작별 재시도', '0~5회. 같은 상태를 재관찰한 뒤에만 다시 시도합니다.', `<div class="setting-control"><input type="range" id="modelRetryInput" min="0" max="5" step="1" value="${state.model.retryLimit}"><span class="value" id="modelRetryValue">${state.model.retryLimit}회</span></div>`)}
+          ${row('발행 전 사용자 승인', '배포팩 1차 안전 경계이며 어떤 모델에서도 끌 수 없습니다.', '<span class="value">항상 사용</span>')}
+          <div class="setting-row"><div class="setting-control"><button class="btn primary" id="applyModelSettingsButton">설정 검증·적용</button><button class="btn" id="resetModelSettingsButton">모델 기본값</button></div><div class="validation" id="modelValidationStatus">현재 설정은 공급자 중립 런타임 형식으로 변환됩니다.</div></div>
+        </section>
+        <section class="settings-card"><h2>런타임 미리보기</h2><div class="setting-row"><pre class="code-preview" id="modelRuntimePreview">${esc(runtimePreview)}</pre></div></section>`);
     } else if (settingsSection === 'agent') {
       const actions = allActions();
       const patterns = PATTERNS.filter(pattern => !state.adaptive.forgotten.includes(pattern.id));
@@ -498,6 +733,45 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     save(); renderAll(); toast(`“${action}” 작업을 추가했습니다.`);
   }
 
+  function selectModelProfile(profileId) {
+    if (!MODEL_PROFILES[profileId]) return;
+    const previous = state.model.selected;
+    state.model = modelDefaults(profileId);
+    record(`AI 모델을 ${previous}에서 ${profileId}(으)로 변경했습니다.`);
+    renderAll();
+    toast(`${MODEL_PROFILES[profileId].name} 모델을 선택했습니다.`);
+  }
+
+  function modelCandidateFromControls() {
+    return {
+      ...state.model,
+      endpoint: $('#modelEndpointInput')?.value || state.model.endpoint,
+      temperature: Number(
+          $('#modelTemperatureInput')?.value ?? state.model.temperature),
+      maxOutputTokens: Number(
+          $('#modelOutputTokensInput')?.value ?? state.model.maxOutputTokens),
+      retryLimit: Number($('#modelRetryInput')?.value ?? state.model.retryLimit),
+      requireHumanPublishApproval: true,
+    };
+  }
+
+  function applyModelSettings() {
+    const candidate = modelCandidateFromControls();
+    const validation = validateModelSettings(candidate);
+    const status = $('#modelValidationStatus');
+    if (!validation.valid) {
+      status.textContent = validation.errors.join(' ');
+      status.className = 'validation error';
+      toast('모델 설정을 적용하지 않았습니다.');
+      return false;
+    }
+    state.model = sanitizeModelSettings(candidate);
+    record(`AI 모델 설정을 검증해 적용했습니다: ${state.model.selected}`);
+    renderAll();
+    toast('모델 설정 검증과 적용을 완료했습니다.');
+    return true;
+  }
+
   document.addEventListener('click', event => {
     const removeLinkTarget = event.target.closest('[data-remove-link]');
     if (removeLinkTarget) {
@@ -514,6 +788,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     }
     if (button.dataset.viewTarget) { switchView(button.dataset.viewTarget); return; }
     if (button.dataset.settingsTarget) { settingsSection = button.dataset.settingsTarget; renderSettings(); renderNavigation(); return; }
+    if (button.dataset.modelProfile) { selectModelProfile(button.dataset.modelProfile); return; }
     if (button.dataset.engine) { setEngine(button.dataset.engine); return; }
     if (button.dataset.startAction) { startAction(button.dataset.startAction); return; }
     if (button.dataset.secondaryTask) { toast(`“${button.dataset.secondaryTask}” 작업은 읽기 전용 기록입니다.`); return; }
@@ -554,6 +829,8 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       case 'adaptiveToggle': state.adaptive.enabled = !state.adaptive.enabled; save(); renderAll(); break;
       case 'forgetAllButton': state.adaptive.forgotten = PATTERNS.map(pattern => pattern.id); save(); renderAll(); toast('학습 기록을 모두 지웠습니다.'); break;
       case 'addWorkflowButton': addWorkflow(); break;
+      case 'applyModelSettingsButton': applyModelSettings(); break;
+      case 'resetModelSettingsButton': state.model = modelDefaults(); record('AI 모델 설정을 기본값으로 되돌렸습니다.'); renderAll(); toast('모델 설정을 기본값으로 되돌렸습니다.'); break;
       case 'openChromeSettingsButton': window.location.assign('chrome://settings/'); break;
       case 'openUpdateSettingsButton': window.location.assign('chrome://settings/help'); break;
     }
@@ -564,12 +841,15 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     if (event.target.id === 'fontScaleInput') { state.appearance.fontScale = Number(event.target.value); save(); applyRoot(); $('#fontScaleValue').textContent = `${event.target.value}%`; }
     if (event.target.id === 'railWidthInput') { state.appearance.railWidth = Number(event.target.value); save(); applyRoot(); $('#railWidthValue').textContent = `${event.target.value}px`; }
     if (event.target.id === 'hourInput') { state.adaptive.hour = Number(event.target.value); save(); $('#hourValue').textContent = HOURS[state.adaptive.hour]; renderStart(); }
+    if (event.target.id === 'modelTemperatureInput') { $('#modelTemperatureValue').textContent = Number(event.target.value).toFixed(1); }
+    if (event.target.id === 'modelRetryInput') { $('#modelRetryValue').textContent = `${event.target.value}회`; }
   });
 
   document.addEventListener('keydown', event => {
     if (event.target.id === 'searchInput' && event.key === 'Enter') { event.preventDefault(); runSearch(); return; }
     if ((event.target.id === 'linkNameInput' || event.target.id === 'linkUrlInput') && event.key === 'Enter') { event.preventDefault(); addLink(); return; }
     if (event.target.id === 'workflowInput' && event.key === 'Enter') { event.preventDefault(); addWorkflow(); return; }
+    if ((event.target.id === 'modelEndpointInput' || event.target.id === 'modelOutputTokensInput') && event.key === 'Enter') { event.preventDefault(); applyModelSettings(); return; }
     if (event.key === 'Escape') {
       if (engineMenuOpen) { engineMenuOpen = false; renderStart(); }
       else if (auditOpen) { auditOpen = false; renderNavigation(); }
@@ -590,6 +870,16 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     reset: () => { state = defaults(); save(); renderAll(); },
     openView: view => switchView(view),
     setAutonomy: value => { state.persona.autonomy = value; state.task.decisions = {}; save(); renderAll(); },
+    getModelRuntimeConfig: () => JSON.parse(JSON.stringify(effectiveModelRuntime())),
+    validateModelSettings: value => JSON.parse(JSON.stringify(validateModelSettings(value))),
+    setModelProfile: value => selectModelProfile(value),
+    importModelSettings: value => {
+      const validation = validateModelSettings(value);
+      if (!validation.valid) return validation;
+      state.model = sanitizeModelSettings(value);
+      save(); renderAll();
+      return {valid: true, errors: []};
+    },
     persist: () => {
       // eslint-disable-next-line no-restricted-properties
       chrome.send('mewebAgentSaveState', [JSON.stringify(state)]);
@@ -608,6 +898,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
           Object.assign(restored[key], parsed[key]);
         }
       }
+      restored.model = sanitizeModelSettings(parsed.model);
       if (!Array.isArray(restored.task.audit)) restored.task.audit = [];
       if (!restored.task.decisions ||
           typeof restored.task.decisions !== 'object') {
