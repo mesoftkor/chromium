@@ -90,8 +90,21 @@
     .autonomy.risky { color:var(--warn); background:#e8ab3f22; }
     .autonomy.auto { color:var(--accent); background:var(--accent-soft); }
     .model-chip { display:block; margin-top:5px; padding:3px 8px; color:var(--accent); text-align:center; border:1px solid var(--line-soft); border-radius:6px; font-size:.72em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .rail-section h2 { margin:0 5px 7px; color:var(--dim); font-size:.73em; letter-spacing:.09em; text-transform:uppercase; }
+    .rail-section-head { display:flex; align-items:center; justify-content:space-between; margin:0 5px 7px; }
+    .rail-section-head h2 { margin:0; color:var(--dim); font-size:.73em; letter-spacing:.09em; text-transform:uppercase; }
+    .rail-list-add { width:22px; height:22px; display:grid; place-items:center; color:var(--dim); border:1px solid var(--line-soft); border-radius:6px; }
+    .rail-list-add:hover { color:var(--accent); border-color:var(--accent); }
     .rail-nav { display:flex; flex-direction:column; gap:3px; }
+    .rail-list-row { display:flex; align-items:center; gap:3px; }
+    .rail-list-row .rail-item { flex:1; min-width:0; }
+    .rail-list-edit { width:25px; height:25px; flex:none; display:grid; place-items:center; color:var(--dim); border-radius:6px; opacity:.55; }
+    .rail-list-row:hover .rail-list-edit, .rail-list-edit:focus-visible { opacity:1; }
+    .rail-list-edit:hover { color:var(--accent); background:var(--surface-2); }
+    .rail-list-editor { display:grid; grid-template-columns:1fr auto; gap:5px; margin:5px 0 8px; padding:7px; border:1px solid var(--line); border-radius:8px; background:var(--surface-2); }
+    .rail-list-editor .text-input { grid-column:1 / -1; padding:6px 8px; }
+    .rail-list-editor select { min-width:0; padding:5px 7px; color:var(--muted); border:1px solid var(--line); border-radius:6px; background:var(--surface); }
+    .rail-list-editor-actions { display:flex; justify-content:flex-end; gap:4px; grid-column:1 / -1; }
+    .rail-list-editor-actions .btn { padding:4px 8px; font-size:.74em; }
     .rail-item {
       width:100%; display:flex; align-items:center; gap:9px; padding:var(--row-padding) 8px;
       color:var(--muted); border-radius:8px; text-align:left;
@@ -333,17 +346,14 @@
         <span class="model-chip" id="modelChip">OpenAI · gpt-4o-mini</span>
       </div>
       <section class="rail-section">
-        <h2>워크스페이스</h2>
-        <nav class="rail-nav">
-          <button class="rail-item" data-view-target="start" aria-current="page"><span class="dot"></span><span class="label">시작 화면</span></button>
-          <button class="rail-item" data-view-target="work"><span class="dot"></span><span class="label">이월 항목 대사</span><span class="chip gate" id="railTaskChip">승인 대기</span></button>
-          <button class="rail-item" data-view-target="settings"><span class="dot"></span><span class="label">환경설정</span></button>
-        </nav>
+        <div class="rail-section-head"><h2>워크스페이스</h2><button class="rail-list-add" data-rail-add="workspace" title="워크스페이스 작업 추가" aria-label="워크스페이스 작업 추가">＋</button></div>
+        <nav class="rail-nav" id="workspaceRailList"></nav>
+        <div id="workspaceRailEditor"></div>
       </section>
       <section class="rail-section">
-        <h2>다른 작업</h2>
-        <button class="rail-item" data-secondary-task="주간 리서치 요약"><span class="dot"></span><span class="label">주간 리서치 요약</span><span class="chip done">완료</span></button>
-        <button class="rail-item" data-secondary-task="경쟁사 모니터링"><span class="dot"></span><span class="label">경쟁사 모니터링</span><span class="chip run">진행 중</span></button>
+        <div class="rail-section-head"><h2>다른 작업</h2><button class="rail-list-add" data-rail-add="other" title="다른 작업 추가" aria-label="다른 작업 추가">＋</button></div>
+        <nav class="rail-nav" id="otherRailList"></nav>
+        <div id="otherRailEditor"></div>
       </section>
       <div class="rail-foot">탭은 MEWEB 네이티브 세로 탭 레일에서 관리됩니다.</div>
     </aside>

@@ -65,6 +65,7 @@
 #include "ui/display/screen.h"
 #include "ui/events/event.h"
 #include "ui/gfx/geometry/point.h"
+#include "ui/gfx/geometry/size.h"
 #include "ui/views/background.h"
 #include "ui/views/border.h"
 #include "ui/views/controls/button/label_button.h"
@@ -88,6 +89,7 @@ constexpr int kKeyboardResizeWidth = 50;
 constexpr int kSnapDistance = 15;
 constexpr int kMewebSettingsIconSize = 16;
 constexpr int kMewebSettingsCornerRadius = 8;
+constexpr int kMewebFooterHeight = 28;
 
 std::u16string MewebSettingsLabel() {
   std::u16string label = u"MEWEB · ";
@@ -174,6 +176,7 @@ VerticalTabStripRegionView::VerticalTabStripRegionView(
       views::kMarginsKey, gfx::Insets::VH(0, region_horizontal_padding));
 
   auto meweb_footer = std::make_unique<views::View>();
+  meweb_footer->SetPreferredSize(gfx::Size(0, kMewebFooterHeight));
   meweb_footer_layout_ =
       meweb_footer->SetLayoutManager(std::make_unique<views::FlexLayout>());
   meweb_footer_layout_->SetOrientation(views::LayoutOrientation::kHorizontal)

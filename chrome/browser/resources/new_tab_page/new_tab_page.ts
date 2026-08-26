@@ -129,6 +129,15 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     dev: {role: '개발 담당', actions: ['PR 리뷰 요약', '이슈 트리아지', '릴리스 노트 초안', '로그 분석']},
     general: {role: '일반 업무 담당', actions: ['메일 정리', '일정 브리핑', '문서 요약', '링크 모음']},
   };
+  const RAIL_TASK_STATUSES = {
+    running: {label: '진행 중', className: 'run'},
+    paused: {label: '대기', className: 'gate'},
+    done: {label: '완료', className: 'done'},
+  };
+  const DEFAULT_OTHER_TASKS = [
+    {id: 'weekly-research', name: '주간 리서치 요약', status: 'done'},
+    {id: 'competitor-monitoring', name: '경쟁사 모니터링', status: 'running'},
+  ];
   const HOURS = ['오전', '오후', '저녁', '야간'];
   const PATTERNS = [
     {id: 'p1', hour: 0, task: '월마감 체크리스트', why: '최근 3주 동안 이 시간대에 같은 작업을 반복했습니다.'},
@@ -355,6 +364,33 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     };
   }
 
+  function sanitizeRailTaskList(candidate, fallback = []) {
+    const source = Array.isArray(candidate) ? candidate : fallback;
+    const ids = new Set();
+    return source.slice(0, 40).map((item, index) => {
+      const value = item && typeof item === 'object' ? item : {};
+      const name = typeof value.name === 'string' ?
+          value.name.trim().slice(0, 80) : '';
+      let id = typeof value.id === 'string' ?
+          value.id.replace(/[^a-z0-9_-]/gi, '-').slice(0, 80) : '';
+      if (!id || ids.has(id)) id = `rail-task-${index + 1}`;
+      ids.add(id);
+      return {
+        id,
+        name,
+        status: RAIL_TASK_STATUSES[value.status] ? value.status : 'running',
+      };
+    }).filter(item => item.name);
+  }
+
+  function sanitizeNavigation(candidate) {
+    const source = candidate && typeof candidate === 'object' ? candidate : {};
+    return {
+      workspace: sanitizeRailTaskList(source.workspace),
+      other: sanitizeRailTaskList(source.other, DEFAULT_OTHER_TASKS),
+    };
+  }
+
   function modelDefaults(profileId = 'openai/gpt-4o-mini') {
     const migrated = LEGACY_MODEL_PROFILE_IDS[profileId] || profileId;
     const selected = MODEL_PROFILES[migrated] ? migrated : MODEL_PROFILE_IDS[0];
@@ -533,6 +569,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       persona: {avatar: 'ribbon', name: '미웹', domain: 'finance', tone: 'standard', autonomy: 'risky', showReason: true},
       workflow: {custom: [], pinned: ['이월 항목 대사', '월마감 체크리스트'], removed: [], shortcuts: true},
       adaptive: {enabled: true, basis: 'time', hour: 0, forgotten: []},
+      navigation: sanitizeNavigation(),
       accounts: sanitizeAccountLabels(),
       model: modelDefaults(),
       start: {engine: 'google', showLinks: true, showTasks: true, links: [
@@ -558,6 +595,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       for (const key of Object.keys(base)) {
         if (parsed[key] && typeof parsed[key] === 'object') Object.assign(base[key], parsed[key]);
       }
+      base.navigation = sanitizeNavigation(parsed.navigation);
       base.accounts = sanitizeAccountLabels(parsed.accounts);
       base.model = sanitizeModelSettings(parsed.model);
       if (!Array.isArray(base.task.audit)) base.task.audit = [];
@@ -599,6 +637,8 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
   let settingsSection = 'agent';
   let engineMenuOpen = false;
   let auditOpen = false;
+  let railListEditor = null;
+  let railTaskSequence = 0;
   let toastTimer = 0;
   const isAgentSidePanel =
       new URLSearchParams(window.location.search).get('mewebAgentSidePanel') ===
@@ -712,7 +752,49 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
         `${modelProfile().providerLabel} · ${modelProfile().name}`;
   }
 
+  function railStatusMarkup(status) {
+    const definition = RAIL_TASK_STATUSES[status] || RAIL_TASK_STATUSES.running;
+    return `<span class="chip ${definition.className}">${definition.label}</span>`;
+  }
+
+  function railTaskRow(section, item, index) {
+    return `<div class="rail-list-row"><button class="rail-item" data-rail-start-section="${section}" data-rail-start-index="${index}"><span class="dot"></span><span class="label">${esc(item.name)}</span>${railStatusMarkup(item.status)}</button><button class="rail-list-edit" data-rail-edit-section="${section}" data-rail-edit-index="${index}" title="${esc(item.name)} 수정" aria-label="${esc(item.name)} 수정">⋯</button></div>`;
+  }
+
+  function renderRailEditor(section) {
+    const host = $(`#${section === 'workspace' ? 'workspace' : 'other'}RailEditor`);
+    if (!host || railListEditor?.section !== section) {
+      if (host) setHtml(host, '');
+      return;
+    }
+    const isCurrent = railListEditor.index === 'current';
+    const index = Number(railListEditor.index);
+    const hasExistingItem = railListEditor.index !== null &&
+        Number.isInteger(index) && index >= 0;
+    const item = isCurrent ? state.task :
+        hasExistingItem ? state.navigation[section][index] : null;
+    const editorItem = item || {name: '', status: 'running'};
+    const options = Object.entries(RAIL_TASK_STATUSES).map(([value, definition]) =>
+      `<option value="${value}" ${editorItem.status === value ? 'selected' : ''}>${definition.label}</option>`).join('');
+    setHtml(host, `<div class="rail-list-editor"><input class="text-input" id="railListNameInput" maxlength="80" value="${esc(editorItem.name || '')}" placeholder="작업 이름"><select id="railListStatusInput" aria-label="작업 상태">${options}</select><div class="rail-list-editor-actions">${railListEditor.index !== null && !isCurrent ? '<button class="btn danger" id="deleteRailListItemButton">삭제</button>' : ''}<button class="btn" id="cancelRailListItemButton">취소</button><button class="btn primary" id="saveRailListItemButton">저장</button></div></div>`);
+    requestAnimationFrame(() => {
+      const input = $('#railListNameInput');
+      input?.focus();
+      input?.select();
+    });
+  }
+
+  function renderRailLists() {
+    const progress = taskProgress();
+    setHtml($('#workspaceRailList'), `<button class="rail-item" data-view-target="start"><span class="dot"></span><span class="label">시작 화면</span></button><div class="rail-list-row"><button class="rail-item" data-view-target="work"><span class="dot"></span><span class="label">${esc(state.task.name)}</span><span class="chip ${progress.complete ? 'done' : progress.gates ? 'gate' : 'run'}">${progress.complete ? '완료' : progress.gates ? '승인 대기' : '진행 중'}</span></button><button class="rail-list-edit" data-rail-edit-section="workspace" data-rail-edit-index="current" title="현재 작업 수정" aria-label="현재 작업 수정">⋯</button></div>${state.navigation.workspace.map((item, index) => railTaskRow('workspace', item, index)).join('')}<button class="rail-item" data-view-target="settings"><span class="dot"></span><span class="label">환경설정</span></button>`);
+    setHtml($('#otherRailList'), state.navigation.other.map(
+        (item, index) => railTaskRow('other', item, index)).join(''));
+    renderRailEditor('workspace');
+    renderRailEditor('other');
+  }
+
   function renderNavigation() {
+    renderRailLists();
     $$('[data-view-target]').forEach(button => button.setAttribute('aria-current', button.dataset.viewTarget === currentView ? 'page' : 'false'));
     $('#startView').hidden = currentView !== 'start';
     $('#workView').hidden = currentView !== 'work';
@@ -766,9 +848,6 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     status.className = `run-status ${state.task.status === 'paused' ? 'paused' : state.persona.autonomy === 'auto' ? 'auto' : ''}`;
     $('#runStatusText').textContent = state.task.status === 'paused' ? '일시 정지됨 · 로컬 실행 엔진' : progress.complete ? '완료 · 로컬 실행 엔진' : progress.gates ? '승인 대기 · 로컬 실행 엔진' : '실행 중 · 로컬 실행 엔진';
     $('#pauseButton').textContent = state.task.status === 'paused' ? '계속 실행' : '일시 정지';
-    const railChip = $('#railTaskChip');
-    railChip.textContent = progress.complete ? '완료' : progress.gates ? '승인 대기' : state.task.status === 'paused' ? '정지됨' : '진행 중';
-    railChip.className = `chip ${progress.complete ? 'done' : progress.gates ? 'gate' : 'run'}`;
 
     setHtml($('#steps'), progress.steps.map(step => {
       const toneText = step.text[state.persona.tone] || step.text.standard;
@@ -1049,6 +1128,68 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     if (view !== 'work') auditOpen = false;
     engineMenuOpen = false;
     renderAll();
+  }
+
+  function openRailListEditor(section, index = null) {
+    if (!['workspace', 'other'].includes(section)) return false;
+    railListEditor = {section, index};
+    renderNavigation();
+    return true;
+  }
+
+  function saveRailListItem(nameOverride, statusOverride) {
+    if (!railListEditor) return false;
+    const name = String(nameOverride ?? $('#railListNameInput')?.value ?? '')
+        .trim().slice(0, 80);
+    const status = RAIL_TASK_STATUSES[statusOverride] ? statusOverride :
+        RAIL_TASK_STATUSES[$('#railListStatusInput')?.value] ?
+        $('#railListStatusInput').value : 'running';
+    if (!name) {
+      toast('작업 이름을 입력하세요.');
+      return false;
+    }
+    const {section, index} = railListEditor;
+    if (index === 'current') {
+      state.task.name = name;
+      state.task.status = status;
+    } else if (index === null) {
+      state.navigation[section].push({
+        id: `${section}-${Date.now()}-${++railTaskSequence}`,
+        name,
+        status,
+      });
+    } else if (state.navigation[section][Number(index)]) {
+      Object.assign(state.navigation[section][Number(index)], {name, status});
+    } else {
+      return false;
+    }
+    railListEditor = null;
+    save();
+    renderAll();
+    toast(`“${name}” 목록을 저장했습니다.`);
+    return true;
+  }
+
+  function deleteRailListItem() {
+    if (!railListEditor || railListEditor.index === null ||
+        railListEditor.index === 'current') return false;
+    const {section} = railListEditor;
+    const [removed] = state.navigation[section].splice(
+        Number(railListEditor.index), 1);
+    railListEditor = null;
+    save();
+    renderAll();
+    if (removed) toast(`“${removed.name}” 목록을 삭제했습니다.`);
+    return Boolean(removed);
+  }
+
+  function startRailTask(section, index) {
+    const item = state.navigation[section]?.[Number(index)];
+    if (!item) return false;
+    item.status = 'running';
+    save();
+    startAction(item.name);
+    return true;
   }
 
   function setEngine(id) {
@@ -1936,6 +2077,20 @@ SmartEditor ONE 프레임을 발견하면 일반 DOM 입력 대신 inspect_edito
       if (settingsSection === 'accounts') refreshAccountConnections();
       return;
     }
+    if (button.dataset.railAdd) {
+      openRailListEditor(button.dataset.railAdd); return;
+    }
+    if (button.dataset.railEditSection) {
+      const rawIndex = button.dataset.railEditIndex;
+      openRailListEditor(button.dataset.railEditSection,
+          rawIndex === 'current' ? 'current' : Number(rawIndex));
+      return;
+    }
+    if (button.dataset.railStartSection) {
+      startRailTask(button.dataset.railStartSection,
+          button.dataset.railStartIndex);
+      return;
+    }
     if (button.dataset.openSiteAccount) {
       openSiteAccountLogin(button.dataset.openSiteAccount); return;
     }
@@ -2013,6 +2168,9 @@ SmartEditor ONE 프레임을 발견하면 일반 DOM 입력 대신 inspect_edito
       case 'showLinkFormButton': $('#linkForm').hidden = false; $('#linkNameInput').focus(); break;
       case 'cancelLinkButton': $('#linkForm').hidden = true; break;
       case 'addLinkButton': addLink(); break;
+      case 'saveRailListItemButton': saveRailListItem(); break;
+      case 'cancelRailListItemButton': railListEditor = null; renderNavigation(); break;
+      case 'deleteRailListItemButton': deleteRailListItem(); break;
       case 'auditButton': auditOpen = !auditOpen; renderNavigation(); break;
       case 'closeAuditButton': auditOpen = false; renderNavigation(); break;
       case 'pauseButton': state.task.status = state.task.status === 'paused' ? 'running' : 'paused'; record(state.task.status === 'paused' ? '작업을 일시 정지했습니다.' : '작업을 계속 실행했습니다.'); renderAll(); break;
@@ -2062,6 +2220,7 @@ SmartEditor ONE 프레임을 발견하면 일반 DOM 입력 대신 inspect_edito
     if (event.target.id === 'searchInput' && event.key === 'Enter') { event.preventDefault(); runSearch(); return; }
     if ((event.target.id === 'linkNameInput' || event.target.id === 'linkUrlInput') && event.key === 'Enter') { event.preventDefault(); addLink(); return; }
     if (event.target.id === 'workflowInput' && event.key === 'Enter') { event.preventDefault(); addWorkflow(); return; }
+    if (event.target.id === 'railListNameInput' && event.key === 'Enter') { event.preventDefault(); saveRailListItem(); return; }
     if (event.target.dataset.siteAccountLabel && event.key === 'Enter') {
       event.preventDefault();
       saveSiteAccountLabel(event.target.dataset.siteAccountLabel);
@@ -2071,6 +2230,7 @@ SmartEditor ONE 프레임을 발견하면 일반 DOM 입력 대신 inspect_edito
     if (event.key === 'Escape') {
       if (engineMenuOpen) { engineMenuOpen = false; renderStart(); }
       else if (auditOpen) { auditOpen = false; renderNavigation(); }
+      else if (railListEditor) { railListEditor = null; renderNavigation(); }
       else if (currentView !== 'start') switchView('start');
       return;
     }
@@ -2085,6 +2245,22 @@ SmartEditor ONE 프레임을 발견하면 일반 DOM 입력 대신 inspect_edito
   window.mewebAgentTest = {
     getState: () => JSON.parse(JSON.stringify(state)),
     getProgress: () => taskProgress(),
+    getRailLists: () => JSON.parse(JSON.stringify({
+      current: state.task,
+      ...state.navigation,
+    })),
+    addRailListItem: (section, name, status = 'running') => {
+      openRailListEditor(section);
+      return saveRailListItem(name, status);
+    },
+    updateRailListItem: (section, index, name, status = 'running') => {
+      openRailListEditor(section, index);
+      return saveRailListItem(name, status);
+    },
+    deleteRailListItem: (section, index) => {
+      openRailListEditor(section, index);
+      return deleteRailListItem();
+    },
     reset: () => {
       state = defaults();
       agentImageAttachments = [];
@@ -2194,6 +2370,7 @@ SmartEditor ONE 프레임을 발견하면 일반 DOM 입력 대신 inspect_edito
         }
       }
       restored.model = sanitizeModelSettings(parsed.model);
+      restored.navigation = sanitizeNavigation(parsed.navigation);
       restored.accounts = sanitizeAccountLabels(parsed.accounts);
       if (!Array.isArray(restored.task.audit)) restored.task.audit = [];
       if (!restored.task.decisions ||

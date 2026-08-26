@@ -1143,6 +1143,7 @@ IN_PROC_BROWSER_TEST_F(VerticalTabStripRegionViewTest,
   EXPECT_GT(settings_button->GetInsets().left(), 1);
   EXPECT_FALSE(footer_label->GetBorder());
   RunScheduledLayouts();
+  EXPECT_EQ(28, settings_button->parent()->height());
   EXPECT_LT(footer_label->bounds().x(), settings_button->bounds().x());
 
   settings_button->button_controller()->NotifyClick();
