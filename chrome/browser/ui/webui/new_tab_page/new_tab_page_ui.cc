@@ -32,6 +32,7 @@
 #include "base/strings/stringprintf.h"
 #include "base/strings/utf_string_conversions.h"
 #include "base/supports_user_data.h"
+#include "base/task/sequenced_task_runner.h"
 #include "base/time/time.h"
 #include "base/values.h"
 #include "build/branding_buildflags.h"
@@ -148,6 +149,7 @@
 #include "services/network/public/cpp/resource_request.h"
 #include "services/network/public/cpp/shared_url_loader_factory.h"
 #include "services/network/public/cpp/simple_url_loader.h"
+#include "services/network/public/cpp/simple_url_loader_stream_consumer.h"
 #include "services/network/public/mojom/content_security_policy.mojom.h"
 #include "services/network/public/mojom/url_response_head.mojom.h"
 #include "skia/ext/skia_utils_base.h"
@@ -258,7 +260,9 @@ MewebMemoryCredentialStore& GetMewebMemoryCredentialStore(Profile* profile) {
   return *store;
 }
 
-class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
+class MewebAgentWorkspaceHandler
+    : public content::WebUIMessageHandler,
+      public network::SimpleURLLoaderStreamConsumer {
  public:
   explicit MewebAgentWorkspaceHandler(Profile* profile) : profile_(profile) {}
 
@@ -312,10 +316,34 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
   }
 
  private:
+  struct ToolCallAccumulator {
+    std::string id;
+    std::string name;
+    std::string arguments;
+  };
+
   struct PendingInference {
     base::Value callback_id;
     std::string provider;
     std::string model;
+    network::ResourceRequest request;
+    std::string upload_body;
+    std::string line_buffer;
+    std::string sse_event;
+    std::string sse_data;
+    std::string text;
+    std::string finish_reason;
+    std::string stream_error;
+    std::map<int, ToolCallAccumulator> tool_calls;
+    int input_tokens = 0;
+    int output_tokens = 0;
+    int total_tokens = 0;
+    int event_sequence = 0;
+    int retry_attempt = 0;
+    int max_retries = 0;
+    int request_sequence = 0;
+    size_t received_bytes = 0;
+    bool received_data = false;
   };
 
   struct PendingObservation {
@@ -462,7 +490,11 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
       return GURL("https://api.anthropic.com/v1/messages");
     }
     if (provider == "gemini") {
-      return endpoint;
+      std::string streaming_url = endpoint.spec();
+      base::ReplaceFirstSubstringAfterOffset(
+          &streaming_url, 0, ":generateContent", ":streamGenerateContent");
+      return GURL(base::StrCat(
+          {streaming_url, endpoint.has_query() ? "&alt=sse" : "?alt=sse"}));
     }
     if (provider == "openrouter") {
       return GURL("https://openrouter.ai/api/v1/chat/completions");
@@ -660,6 +692,7 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     base::DictValue payload;
     payload.Set("model", model);
     if (provider == "openai") {
+      payload.Set("stream", true);
       payload.Set("input", prompt);
       if (!instructions.empty()) {
         payload.Set("instructions", instructions);
@@ -675,6 +708,7 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
       return payload;
     }
     if (provider == "anthropic") {
+      payload.Set("stream", true);
       base::ListValue messages;
       AppendMessage(&messages, "user", prompt);
       payload.Set("messages", std::move(messages));
@@ -763,12 +797,16 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
       AppendMessage(&messages, "user", prompt);
       payload.Set("messages", std::move(messages));
       if (provider == "ollama") {
-        payload.Set("stream", false);
+        payload.Set("stream", true);
         base::DictValue options;
         options.Set("temperature", temperature);
         options.Set("num_predict", max_output_tokens);
         payload.Set("options", std::move(options));
       } else {
+        payload.Set("stream", true);
+        base::DictValue stream_options;
+        stream_options.Set("include_usage", true);
+        payload.Set("stream_options", std::move(stream_options));
         payload.Set("max_tokens", max_output_tokens);
         payload.Set("temperature", temperature);
       }
@@ -808,11 +846,11 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
   }
 
   void HandleModelGenerate(const base::ListValue& args) {
-    if (args.size() != 11 || !args[0].is_string() || !args[1].is_string() ||
+    if (args.size() != 12 || !args[0].is_string() || !args[1].is_string() ||
         !args[2].is_string() || !args[3].is_string() || !args[4].is_string() ||
         !args[5].is_string() || !args[6].is_string() || !args[7].is_int() ||
         (!args[8].is_double() && !args[8].is_int()) || !args[9].is_string() ||
-        !args[10].is_string()) {
+        !args[10].is_string() || !args[11].is_int()) {
       return;
     }
     const std::string& provider = args[1].GetString();
@@ -826,6 +864,7 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
         args[8].is_double() ? args[8].GetDouble() : args[8].GetInt();
     const std::string& tool_choice = args[9].GetString();
     const std::string& tools_json = args[10].GetString();
+    const int retry_limit = args[11].GetInt();
     auto error = [&](std::string_view message) {
       Reply(args[0], InferenceResult(provider, model, "error", message));
     };
@@ -834,7 +873,7 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
       error("공급자, 인증 방식 또는 API 주소가 허용되지 않습니다.");
       return;
     }
-    if (inference_loader_) {
+    if (inference_loader_ || pending_inference_) {
       error("다른 모델 요청이 실행 중입니다.");
       return;
     }
@@ -842,7 +881,8 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
         prompt.size() > kMaxMewebModelPromptBytes ||
         instructions.size() > kMaxMewebModelPromptBytes ||
         max_output_tokens < 1 || max_output_tokens > 131072 ||
-        temperature < 0 || temperature > 1 ||
+        temperature < 0 || temperature > 1 || retry_limit < 0 ||
+        retry_limit > 5 ||
         (tool_choice != "required" && tool_choice != "auto" &&
          tool_choice != "none") ||
         tools_json.size() > kMaxMewebModelToolsBytes) {
@@ -896,8 +936,18 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     if (provider == "anthropic") {
       request->headers.SetHeader("anthropic-version", "2023-06-01");
     }
-    StartInference(std::move(request), std::move(body),
-                   PendingInference{args[0].Clone(), provider, model});
+    request->headers.SetHeader(
+        net::HttpRequestHeaders::kAccept,
+        provider == "ollama" ? "application/x-ndjson" : "text/event-stream");
+    PendingInference pending;
+    pending.callback_id = args[0].Clone();
+    pending.provider = provider;
+    pending.model = model;
+    pending.request = *request;
+    pending.upload_body = body;
+    pending.max_retries = retry_limit;
+    pending.request_sequence = ++inference_request_sequence_;
+    StartInference(std::move(request), std::move(body), std::move(pending));
   }
 
   void HandleModelCancel(const base::ListValue& args) {
@@ -910,6 +960,7 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
       PendingInference cancelled = std::move(*pending_inference_);
       pending_inference_.reset();
       inference_loader_.reset();
+      ++inference_request_sequence_;
       Reply(cancelled.callback_id,
             InferenceResult(cancelled.provider, cancelled.model, "cancelled",
                             "사용자가 모델 요청을 취소했습니다."));
@@ -1756,9 +1807,541 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     return result;
   }
 
-  void StartInference(std::unique_ptr<network::ResourceRequest> request,
-                      std::string upload_body,
-                      PendingInference pending) {
+  base::ListValue StreamingToolCalls(bool validate, bool* valid) const {
+    base::ListValue calls;
+    if (valid) {
+      *valid = true;
+    }
+    if (!pending_inference_) {
+      return calls;
+    }
+    for (const auto& [index, accumulated] : pending_inference_->tool_calls) {
+      std::string arguments =
+          accumulated.arguments.empty() ? "{}" : accumulated.arguments;
+      if (validate) {
+        auto parsed = base::JSONReader::Read(arguments, 0);
+        if (accumulated.name.empty() || !parsed || !parsed->is_dict()) {
+          if (valid) {
+            *valid = false;
+          }
+          continue;
+        }
+      }
+      base::DictValue call;
+      call.Set("id", accumulated.id);
+      call.Set("name", accumulated.name);
+      call.Set("arguments", std::move(arguments));
+      call.Set("index", index);
+      calls.Append(std::move(call));
+    }
+    return calls;
+  }
+
+  void EmitInferenceStreamEvent(
+      std::string_view event_name,
+      std::string_view text_delta = std::string_view(),
+      std::string_view arguments_delta = std::string_view(),
+      bool reset = false) {
+    if (!pending_inference_) {
+      return;
+    }
+    auto event =
+        InferenceResult(pending_inference_->provider, pending_inference_->model,
+                        "streaming", "모델 응답을 실시간으로 받고 있습니다.");
+    event.Set("event", event_name);
+    event.Set("sequence", ++pending_inference_->event_sequence);
+    event.Set("text_delta", text_delta);
+    event.Set("arguments_delta", arguments_delta);
+    event.Set("text", pending_inference_->text);
+    event.Set("tool_calls", StreamingToolCalls(false, nullptr));
+    event.Set("finish_reason", pending_inference_->finish_reason);
+    event.Set("retry_attempt", pending_inference_->retry_attempt);
+    event.Set("reset", reset);
+    base::DictValue usage;
+    usage.Set("input_tokens", pending_inference_->input_tokens);
+    usage.Set("output_tokens", pending_inference_->output_tokens);
+    usage.Set("total_tokens", pending_inference_->total_tokens);
+    event.Set("usage", std::move(usage));
+    AllowJavascript();
+    CallJavascriptFunction("mewebModelStreamEvent",
+                           pending_inference_->callback_id,
+                           base::Value(std::move(event)));
+  }
+
+  void ResetInferenceStreamForRetry() {
+    if (!pending_inference_) {
+      return;
+    }
+    pending_inference_->line_buffer.clear();
+    pending_inference_->sse_event.clear();
+    pending_inference_->sse_data.clear();
+    pending_inference_->text.clear();
+    pending_inference_->finish_reason.clear();
+    pending_inference_->stream_error.clear();
+    pending_inference_->tool_calls.clear();
+    pending_inference_->input_tokens = 0;
+    pending_inference_->output_tokens = 0;
+    pending_inference_->total_tokens = 0;
+    pending_inference_->received_bytes = 0;
+    pending_inference_->received_data = false;
+  }
+
+  ToolCallAccumulator& StreamingToolCall(int index) {
+    return pending_inference_->tool_calls[index];
+  }
+
+  void AppendStreamingText(std::string_view delta) {
+    if (!pending_inference_ || delta.empty()) {
+      return;
+    }
+    if (pending_inference_->text.size() + delta.size() >
+        kMaxMewebModelInferenceResponseBytes) {
+      pending_inference_->stream_error =
+          "스트리밍 텍스트가 허용 크기를 초과했습니다.";
+      return;
+    }
+    pending_inference_->text.append(delta);
+    EmitInferenceStreamEvent("text_delta", delta);
+  }
+
+  void UpdateStreamingToolCall(int index,
+                               std::string_view id,
+                               std::string_view name,
+                               std::string_view arguments,
+                               bool append_arguments) {
+    if (!pending_inference_) {
+      return;
+    }
+    auto& tool = StreamingToolCall(std::max(0, index));
+    if (!id.empty()) {
+      tool.id = id;
+    }
+    if (!name.empty()) {
+      tool.name = name;
+    }
+    if (!arguments.empty()) {
+      if (append_arguments) {
+        tool.arguments.append(arguments);
+      } else {
+        tool.arguments = arguments;
+      }
+    }
+    EmitInferenceStreamEvent("tool_call_delta", std::string_view(), arguments);
+  }
+
+  void UpdateStreamingUsage(
+      const base::DictValue* usage,
+      std::initializer_list<std::string_view> input_names,
+      std::initializer_list<std::string_view> output_names,
+      std::initializer_list<std::string_view> total_names) {
+    if (!pending_inference_ || !usage) {
+      return;
+    }
+    const int input = UsageInt(usage, input_names);
+    const int output = UsageInt(usage, output_names);
+    const int total = UsageInt(usage, total_names);
+    if (input > 0) {
+      pending_inference_->input_tokens = input;
+    }
+    if (output > 0) {
+      pending_inference_->output_tokens = output;
+    }
+    if (total > 0) {
+      pending_inference_->total_tokens = total;
+    }
+  }
+
+  void ProcessOpenAiStreamEvent(std::string_view event_name,
+                                const base::DictValue& root) {
+    const std::string* root_type = root.FindString("type");
+    const std::string_view type =
+        root_type ? std::string_view(*root_type) : event_name;
+    if (type == "response.output_text.delta") {
+      if (const std::string* delta = root.FindString("delta")) {
+        AppendStreamingText(*delta);
+      }
+      return;
+    }
+    if (type == "response.function_call_arguments.delta") {
+      const int index = root.FindInt("output_index").value_or(0);
+      const std::string* delta = root.FindString("delta");
+      UpdateStreamingToolCall(
+          index, std::string_view(), std::string_view(),
+          delta ? std::string_view(*delta) : std::string_view(), true);
+      return;
+    }
+    if (type == "response.output_item.added" ||
+        type == "response.output_item.done") {
+      const auto* item = root.FindDict("item");
+      if (item && item->FindString("type") &&
+          *item->FindString("type") == "function_call") {
+        const int index = root.FindInt("output_index").value_or(0);
+        const std::string* id = item->FindString("call_id");
+        const std::string* name = item->FindString("name");
+        const std::string* arguments = item->FindString("arguments");
+        UpdateStreamingToolCall(
+            index, id ? std::string_view(*id) : std::string_view(),
+            name ? std::string_view(*name) : std::string_view(),
+            arguments ? std::string_view(*arguments) : std::string_view(),
+            false);
+      }
+      return;
+    }
+    if (type == "response.completed") {
+      const auto* response = root.FindDict("response");
+      if (response) {
+        if (const std::string* status = response->FindString("status")) {
+          pending_inference_->finish_reason = *status;
+        }
+        UpdateStreamingUsage(response->FindDict("usage"), {"input_tokens"},
+                             {"output_tokens"}, {"total_tokens"});
+      }
+      return;
+    }
+    if (type == "response.failed" || type == "error") {
+      pending_inference_->stream_error = "OpenAI 스트림이 오류를 반환했습니다.";
+    }
+  }
+
+  void ProcessAnthropicStreamEvent(std::string_view event_name,
+                                   const base::DictValue& root) {
+    const std::string* root_type = root.FindString("type");
+    const std::string_view type =
+        root_type ? std::string_view(*root_type) : event_name;
+    if (type == "message_start") {
+      const auto* message = root.FindDict("message");
+      UpdateStreamingUsage(message ? message->FindDict("usage") : nullptr,
+                           {"input_tokens"}, {"output_tokens"}, {});
+      return;
+    }
+    if (type == "content_block_start") {
+      const int index = root.FindInt("index").value_or(0);
+      const auto* block = root.FindDict("content_block");
+      if (block && block->FindString("type") &&
+          *block->FindString("type") == "tool_use") {
+        UpdateStreamingToolCall(
+            index, block->FindString("id") ? *block->FindString("id") : "",
+            block->FindString("name") ? *block->FindString("name") : "", "",
+            false);
+      }
+      return;
+    }
+    if (type == "content_block_delta") {
+      const int index = root.FindInt("index").value_or(0);
+      const auto* delta = root.FindDict("delta");
+      if (!delta) {
+        return;
+      }
+      const std::string* delta_type = delta->FindString("type");
+      if (delta_type && *delta_type == "text_delta") {
+        if (const std::string* text = delta->FindString("text")) {
+          AppendStreamingText(*text);
+        }
+      } else if (delta_type && *delta_type == "input_json_delta") {
+        const std::string* partial = delta->FindString("partial_json");
+        UpdateStreamingToolCall(
+            index, std::string_view(), std::string_view(),
+            partial ? std::string_view(*partial) : std::string_view(), true);
+      }
+      return;
+    }
+    if (type == "message_delta") {
+      if (const auto* delta = root.FindDict("delta")) {
+        if (const std::string* reason = delta->FindString("stop_reason")) {
+          pending_inference_->finish_reason = *reason;
+        }
+      }
+      UpdateStreamingUsage(root.FindDict("usage"), {}, {"output_tokens"}, {});
+      return;
+    }
+    if (type == "error") {
+      pending_inference_->stream_error =
+          "Anthropic 스트림이 오류를 반환했습니다.";
+    }
+  }
+
+  void ProcessGeminiStreamEvent(const base::DictValue& root) {
+    const auto* candidates = root.FindList("candidates");
+    if (candidates && !candidates->empty() && (*candidates)[0].is_dict()) {
+      const auto& candidate = (*candidates)[0].GetDict();
+      if (const std::string* reason = candidate.FindString("finishReason")) {
+        pending_inference_->finish_reason = *reason;
+      }
+      if (const auto* content = candidate.FindDict("content")) {
+        if (const auto* parts = content->FindList("parts")) {
+          for (size_t index = 0; index < parts->size(); ++index) {
+            if (!(*parts)[index].is_dict()) {
+              continue;
+            }
+            const auto& part = (*parts)[index].GetDict();
+            if (const std::string* text = part.FindString("text")) {
+              AppendStreamingText(*text);
+            }
+            if (const auto* call = part.FindDict("functionCall")) {
+              UpdateStreamingToolCall(
+                  static_cast<int>(index), "",
+                  call->FindString("name") ? *call->FindString("name") : "",
+                  JsonString(call->Find("args")), false);
+            }
+          }
+        }
+      }
+    }
+    UpdateStreamingUsage(root.FindDict("usageMetadata"), {"promptTokenCount"},
+                         {"candidatesTokenCount"}, {"totalTokenCount"});
+  }
+
+  void ProcessOllamaStreamEvent(const base::DictValue& root) {
+    const auto* message = root.FindDict("message");
+    if (message) {
+      if (const std::string* text = message->FindString("content")) {
+        AppendStreamingText(*text);
+      }
+      if (const auto* calls = message->FindList("tool_calls")) {
+        for (size_t index = 0; index < calls->size(); ++index) {
+          if (!(*calls)[index].is_dict()) {
+            continue;
+          }
+          const auto& call = (*calls)[index].GetDict();
+          const auto* function = call.FindDict("function");
+          if (!function) {
+            continue;
+          }
+          UpdateStreamingToolCall(
+              static_cast<int>(index),
+              call.FindString("id") ? *call.FindString("id") : "",
+              function->FindString("name") ? *function->FindString("name") : "",
+              JsonString(function->Find("arguments")), false);
+        }
+      }
+    }
+    if (root.FindBool("done").value_or(false)) {
+      if (const std::string* reason = root.FindString("done_reason")) {
+        pending_inference_->finish_reason = *reason;
+      }
+      UpdateStreamingUsage(&root, {"prompt_eval_count"}, {"eval_count"}, {});
+    }
+  }
+
+  void ProcessOpenRouterStreamEvent(const base::DictValue& root) {
+    const auto* choices = root.FindList("choices");
+    if (choices && !choices->empty() && (*choices)[0].is_dict()) {
+      const auto& choice = (*choices)[0].GetDict();
+      if (const std::string* reason = choice.FindString("finish_reason")) {
+        pending_inference_->finish_reason = *reason;
+      }
+      if (const auto* delta = choice.FindDict("delta")) {
+        if (const std::string* text = delta->FindString("content")) {
+          AppendStreamingText(*text);
+        }
+        if (const auto* calls = delta->FindList("tool_calls")) {
+          for (const auto& call_value : *calls) {
+            if (!call_value.is_dict()) {
+              continue;
+            }
+            const auto& call = call_value.GetDict();
+            const int index = call.FindInt("index").value_or(0);
+            const auto* function = call.FindDict("function");
+            UpdateStreamingToolCall(
+                index, call.FindString("id") ? *call.FindString("id") : "",
+                function && function->FindString("name")
+                    ? *function->FindString("name")
+                    : "",
+                function && function->FindString("arguments")
+                    ? *function->FindString("arguments")
+                    : "",
+                true);
+          }
+        }
+      }
+    }
+    UpdateStreamingUsage(
+        root.FindDict("usage"), {"prompt_tokens", "input_tokens"},
+        {"completion_tokens", "output_tokens"}, {"total_tokens"});
+  }
+
+  void ProcessInferenceStreamJson(std::string_view event_name,
+                                  std::string_view data) {
+    if (!pending_inference_ || data.empty() || data == "[DONE]") {
+      return;
+    }
+    auto parsed = base::JSONReader::Read(data, 0);
+    if (!parsed || !parsed->is_dict()) {
+      pending_inference_->stream_error =
+          "모델 스트림 이벤트가 올바른 JSON 객체가 아닙니다.";
+      return;
+    }
+    pending_inference_->received_data = true;
+    const auto& root = parsed->GetDict();
+    if (const auto* error = root.FindDict("error")) {
+      pending_inference_->stream_error =
+          error->FindString("message")
+              ? *error->FindString("message")
+              : "모델 공급자가 스트림 오류를 반환했습니다.";
+      return;
+    }
+    if (pending_inference_->provider == "openai") {
+      ProcessOpenAiStreamEvent(event_name, root);
+    } else if (pending_inference_->provider == "anthropic") {
+      ProcessAnthropicStreamEvent(event_name, root);
+    } else if (pending_inference_->provider == "gemini") {
+      ProcessGeminiStreamEvent(root);
+    } else if (pending_inference_->provider == "ollama") {
+      ProcessOllamaStreamEvent(root);
+    } else if (pending_inference_->provider == "openrouter") {
+      ProcessOpenRouterStreamEvent(root);
+    }
+  }
+
+  void DispatchSseEvent() {
+    if (!pending_inference_) {
+      return;
+    }
+    if (!pending_inference_->sse_data.empty()) {
+      ProcessInferenceStreamJson(pending_inference_->sse_event,
+                                 pending_inference_->sse_data);
+    }
+    pending_inference_->sse_event.clear();
+    pending_inference_->sse_data.clear();
+  }
+
+  void ProcessInferenceStreamLine(std::string line) {
+    if (!pending_inference_) {
+      return;
+    }
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    if (pending_inference_->provider == "ollama") {
+      base::TrimWhitespaceASCII(line, base::TRIM_ALL, &line);
+      if (!line.empty()) {
+        ProcessInferenceStreamJson(std::string_view(), line);
+      }
+      return;
+    }
+    if (line.empty()) {
+      DispatchSseEvent();
+      return;
+    }
+    if (base::StartsWith(line, "event:")) {
+      pending_inference_->sse_event =
+          base::TrimWhitespaceASCII(line.substr(6), base::TRIM_ALL);
+      return;
+    }
+    if (base::StartsWith(line, "data:")) {
+      if (!pending_inference_->sse_data.empty()) {
+        pending_inference_->sse_data.push_back('\n');
+      }
+      pending_inference_->sse_data.append(
+          base::TrimWhitespaceASCII(line.substr(5), base::TRIM_ALL));
+      return;
+    }
+    if (line.front() == '{' && pending_inference_->sse_data.empty()) {
+      pending_inference_->sse_data = std::move(line);
+    }
+  }
+
+  void FlushInferenceStreamBuffer() {
+    if (!pending_inference_) {
+      return;
+    }
+    if (!pending_inference_->line_buffer.empty()) {
+      std::string line = std::move(pending_inference_->line_buffer);
+      pending_inference_->line_buffer.clear();
+      ProcessInferenceStreamLine(std::move(line));
+    }
+    if (pending_inference_ && pending_inference_->provider != "ollama") {
+      DispatchSseEvent();
+    }
+  }
+
+  void FinishInferenceStream(bool success,
+                             int http_status,
+                             std::string_view failure_message) {
+    if (!pending_inference_) {
+      return;
+    }
+    bool tools_valid = true;
+    base::ListValue tool_calls = StreamingToolCalls(success, &tools_valid);
+    const bool completed =
+        success && tools_valid && pending_inference_->stream_error.empty();
+    std::string message =
+        completed ? "모델 스트리밍 응답을 받았습니다."
+        : !pending_inference_->stream_error.empty()
+            ? pending_inference_->stream_error
+        : !tools_valid ? "분할 도구 호출 JSON을 안전하게 조립할 수 없습니다."
+                       : std::string(failure_message);
+    auto result =
+        InferenceResult(pending_inference_->provider, pending_inference_->model,
+                        completed ? "completed" : "error", message);
+    result.Set("text", pending_inference_->text);
+    result.Set("tool_calls", std::move(tool_calls));
+    result.Set("finish_reason", pending_inference_->finish_reason);
+    result.Set("http_status", http_status);
+    result.Set("streamed", true);
+    result.Set("stream_event_count", pending_inference_->event_sequence);
+    result.Set("retry_count", pending_inference_->retry_attempt);
+    base::DictValue usage;
+    usage.Set("input_tokens", pending_inference_->input_tokens);
+    usage.Set("output_tokens", pending_inference_->output_tokens);
+    usage.Set("total_tokens", pending_inference_->total_tokens > 0
+                                  ? pending_inference_->total_tokens
+                                  : pending_inference_->input_tokens +
+                                        pending_inference_->output_tokens);
+    result.Set("usage", std::move(usage));
+    if (completed) {
+      EmitInferenceStreamEvent("completed");
+    }
+    base::Value callback_id = pending_inference_->callback_id.Clone();
+    pending_inference_.reset();
+    inference_loader_.reset();
+    Reply(callback_id, std::move(result));
+  }
+
+  static base::TimeDelta ProviderRetryDelay(std::string_view provider,
+                                            int attempt) {
+    int milliseconds = 1000;
+    if (provider == "anthropic") {
+      milliseconds = 2000;
+    } else if (provider == "gemini") {
+      milliseconds = 750;
+    } else if (provider == "ollama") {
+      milliseconds = 250;
+    }
+    return base::Milliseconds(
+        std::min(8000, milliseconds * (1 << std::min(attempt, 3))));
+  }
+
+  void ScheduleInferenceRetry(base::TimeDelta delay, std::string_view reason) {
+    if (!pending_inference_ ||
+        pending_inference_->retry_attempt >= pending_inference_->max_retries) {
+      return;
+    }
+    ++pending_inference_->retry_attempt;
+    const int request_sequence = pending_inference_->request_sequence;
+    ResetInferenceStreamForRetry();
+    EmitInferenceStreamEvent(reason, std::string_view(), std::string_view(),
+                             true);
+    inference_loader_.reset();
+    base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
+        FROM_HERE,
+        base::BindOnce(&MewebAgentWorkspaceHandler::RetryInference,
+                       weak_ptr_factory_.GetWeakPtr(), request_sequence),
+        delay);
+  }
+
+  void RetryInference(int request_sequence) {
+    if (!pending_inference_ ||
+        pending_inference_->request_sequence != request_sequence) {
+      return;
+    }
+    auto request =
+        std::make_unique<network::ResourceRequest>(pending_inference_->request);
+    StartInferenceAttempt(std::move(request), pending_inference_->upload_body);
+  }
+
+  void StartInferenceAttempt(std::unique_ptr<network::ResourceRequest> request,
+                             std::string upload_body) {
     constexpr net::NetworkTrafficAnnotationTag traffic_annotation =
         net::DefineNetworkTrafficAnnotation("meweb_model_inference", R"(
           semantics {
@@ -1780,52 +2363,118 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
             policy_exception_justification:
               "This is a user-requested connection to a selected AI provider."
           })");
-    pending_inference_ = std::move(pending);
     inference_loader_ = network::SimpleURLLoader::Create(std::move(request),
                                                          traffic_annotation);
+    inference_loader_->SetAllowHttpErrorResults(true);
+    if (pending_inference_) {
+      const int retries = std::max(0, pending_inference_->max_retries -
+                                          pending_inference_->retry_attempt);
+      inference_loader_->SetRetryOptions(
+          retries, network::SimpleURLLoader::RETRY_ON_5XX |
+                       network::SimpleURLLoader::RETRY_ON_NETWORK_CHANGE |
+                       network::SimpleURLLoader::RETRY_ON_NAME_NOT_RESOLVED);
+      inference_loader_->SetTimeoutDuration(base::Minutes(2));
+    }
     inference_loader_->AttachStringForUpload(std::move(upload_body),
                                              "application/json");
-    inference_loader_->DownloadToString(
-        profile_->GetURLLoaderFactory().get(),
-        base::BindOnce(&MewebAgentWorkspaceHandler::OnInferenceFinished,
-                       weak_ptr_factory_.GetWeakPtr()),
-        kMaxMewebModelInferenceResponseBytes);
+    inference_loader_->DownloadAsStream(profile_->GetURLLoaderFactory().get(),
+                                        this);
   }
 
-  void OnInferenceFinished(std::optional<std::string> body) {
+  void StartInference(std::unique_ptr<network::ResourceRequest> request,
+                      std::string upload_body,
+                      PendingInference pending) {
+    pending_inference_ = std::move(pending);
+    StartInferenceAttempt(std::move(request), std::move(upload_body));
+  }
+
+  void OnDataReceived(std::string_view chunk,
+                      base::OnceClosure resume) override {
     if (!pending_inference_) {
       return;
     }
-    PendingInference pending = std::move(*pending_inference_);
-    pending_inference_.reset();
-    const int network_error =
-        inference_loader_ ? inference_loader_->NetError() : net::ERR_FAILED;
+    pending_inference_->received_bytes += chunk.size();
+    if (pending_inference_->received_bytes >
+        kMaxMewebModelInferenceResponseBytes) {
+      pending_inference_->stream_error =
+          "모델 스트림이 허용 크기를 초과했습니다.";
+      FinishInferenceStream(false, 0,
+                            "모델 스트림이 허용 크기를 초과했습니다.");
+      return;
+    }
+    pending_inference_->line_buffer.append(chunk);
+    size_t newline = std::string::npos;
+    while (pending_inference_ &&
+           (newline = pending_inference_->line_buffer.find('\n')) !=
+               std::string::npos) {
+      std::string line = pending_inference_->line_buffer.substr(0, newline);
+      pending_inference_->line_buffer.erase(0, newline + 1);
+      ProcessInferenceStreamLine(std::move(line));
+    }
+    if (!pending_inference_) {
+      return;
+    }
+    if (!pending_inference_->stream_error.empty()) {
+      FinishInferenceStream(false, 0, pending_inference_->stream_error);
+      return;
+    }
+    std::move(resume).Run();
+  }
+
+  void OnComplete(bool success) override {
+    if (!pending_inference_) {
+      return;
+    }
+    FlushInferenceStreamBuffer();
     int http_status = 0;
     if (inference_loader_ && inference_loader_->ResponseInfo() &&
         inference_loader_->ResponseInfo()->headers) {
       http_status = inference_loader_->ResponseInfo()->headers->response_code();
     }
-    inference_loader_.reset();
-    if (network_error != net::OK || http_status < 200 || http_status > 299 ||
-        !body) {
-      auto result =
-          InferenceResult(pending.provider, pending.model, "error",
+    const int network_error =
+        inference_loader_ ? inference_loader_->NetError() : net::ERR_FAILED;
+    const bool retryable = http_status == 429 || network_error != net::OK;
+    if (retryable &&
+        pending_inference_->retry_attempt < pending_inference_->max_retries) {
+      base::TimeDelta delay =
+          ModelTestOrigin()
+              ? base::TimeDelta()
+              : ProviderRetryDelay(pending_inference_->provider,
+                                   pending_inference_->retry_attempt);
+      if (http_status == 429 && inference_loader_ &&
+          inference_loader_->ResponseInfo() &&
+          inference_loader_->ResponseInfo()->headers) {
+        auto retry_after =
+            inference_loader_->ResponseInfo()->headers->EnumerateHeader(
+                nullptr, "retry-after");
+        int seconds = 0;
+        if (retry_after && base::StringToInt(*retry_after, &seconds)) {
+          delay = std::min(base::Seconds(std::clamp(seconds, 0, 30)),
+                           base::Seconds(30));
+        }
+      }
+      ScheduleInferenceRetry(
+          delay, http_status == 429 ? "rate_limit_retry" : "network_retry");
+      return;
+    }
+    const bool completed = success && network_error == net::OK &&
+                           http_status >= 200 && http_status <= 299 &&
+                           pending_inference_->received_data;
+    FinishInferenceStream(completed, http_status,
                           network_error == net::OK
                               ? "모델 공급자가 요청을 거부했습니다."
-                              : "모델 공급자 네트워크 요청에 실패했습니다.");
-      result.Set("http_status", http_status);
-      Reply(pending.callback_id, std::move(result));
+                              : "모델 스트림 연결이 끊겼습니다.");
+  }
+
+  void OnRetry(base::OnceClosure start_retry) override {
+    if (!pending_inference_) {
       return;
     }
-    auto result =
-        ParseInferenceResponse(pending.provider, pending.model, *body);
-    if (!result) {
-      Reply(pending.callback_id,
-            InferenceResult(pending.provider, pending.model, "error",
-                            "모델 공급자 응답 형식을 해석할 수 없습니다."));
-      return;
-    }
-    Reply(pending.callback_id, std::move(*result));
+    ++pending_inference_->retry_attempt;
+    ResetInferenceStreamForRetry();
+    EmitInferenceStreamEvent("transport_retry", std::string_view(),
+                             std::string_view(), true);
+    std::move(start_retry).Run();
   }
   void HandleSaveState(const base::ListValue& args) {
     if (args.size() == 1 && args[0].is_string()) {
@@ -1854,6 +2503,7 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
   std::unique_ptr<network::SimpleURLLoader> auth_loader_;
   std::unique_ptr<network::SimpleURLLoader> inference_loader_;
   std::optional<PendingInference> pending_inference_;
+  int inference_request_sequence_ = 0;
   int observation_sequence_ = 0;
   std::optional<PendingObservation> pending_observation_;
   base::WeakPtrFactory<MewebAgentWorkspaceHandler> weak_ptr_factory_{this};

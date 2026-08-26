@@ -264,6 +264,9 @@
     .agent-message.error { max-width:100%; color:var(--danger); border-color:#f0736a55; }
     .agent-message small { display:block; margin-bottom:3px; color:var(--dim); font-size:.68em; }
     .agent-message p { margin:0; white-space:pre-wrap; overflow-wrap:anywhere; font-size:.8em; }
+    .agent-message.streaming { border-color:var(--accent); }
+    .agent-message.streaming p::after { content:'▋'; margin-left:2px; color:var(--accent); animation:agent-caret .8s steps(1) infinite; }
+    @keyframes agent-caret { 50% { opacity:0; } }
     .agent-plan { margin:10px 0; padding:10px; border:1px solid var(--line-soft); border-radius:9px; background:var(--surface); }
     .agent-plan h3 { margin:0 0 7px; color:var(--dim); font-size:.7em; letter-spacing:.08em; text-transform:uppercase; }
     .agent-plan-row { display:flex; gap:7px; padding:4px 0; color:var(--muted); font-size:.75em; }

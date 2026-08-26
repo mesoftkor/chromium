@@ -71,17 +71,29 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
   let modelAuthRequestSequence = 0;
   const pendingModelAuthRequests = new Map();
   window.mewebModelAuthResponse = (requestId, result) => {
-    const resolve = pendingModelAuthRequests.get(requestId);
-    if (!resolve) return;
+    const pending = pendingModelAuthRequests.get(requestId);
+    if (!pending) return;
     pendingModelAuthRequests.delete(requestId);
-    resolve(result);
+    pending.resolve(result);
+  };
+  window.mewebModelStreamEvent = (requestId, event) => {
+    const pending = pendingModelAuthRequests.get(requestId);
+    if (!pending?.onStream) return;
+    pending.onStream(event);
   };
   const sendModelAuthRequest = (method, ...args) => new Promise(resolve => {
     const requestId = `meweb-model-auth-${++modelAuthRequestSequence}`;
-    pendingModelAuthRequests.set(requestId, resolve);
+    pendingModelAuthRequests.set(requestId, {resolve, onStream: null});
     // eslint-disable-next-line no-restricted-properties
     chrome.send(method, [requestId, ...args]);
   });
+  const sendModelStreamRequest = (method, onStream, ...args) =>
+    new Promise(resolve => {
+      const requestId = `meweb-model-stream-${++modelAuthRequestSequence}`;
+      pendingModelAuthRequests.set(requestId, {resolve, onStream});
+      // eslint-disable-next-line no-restricted-properties
+      chrome.send(method, [requestId, ...args]);
+    });
   // Dynamic values are escaped before they reach this policy. Keeping the
   // policy local to the MEWEB NTP lets Chromium's Trusted Types enforcement
   // remain enabled for every other script sink.
@@ -530,6 +542,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     text: '', tool_calls: [],
     usage: {input_tokens: 0, output_tokens: 0, total_tokens: 0},
   };
+  let modelStreamEvents = [];
   let modelTestPrompt = 'MEWEB 모델 연결 시험입니다. 한 문장으로 응답하세요.';
   let currentView = 'start';
   let settingsSection = 'agent';
@@ -545,6 +558,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     status: 'idle', message: '대기 중', goal: '', observation: null,
     messages: [{role: 'system', text: '현재 탭을 관찰한 뒤 안전한 동작만 실행합니다. 발행·게시·임시저장은 항상 차단됩니다.'}],
     plan: [], pendingApproval: null, actionCount: 0,
+    stream: {status: 'idle', text: '', tool_calls: [], eventCount: 0, retryCount: 0},
   };
   const AGENT_TOOLS = [
     {name: 'navigate', description: '활성 탭을 HTTP 또는 HTTPS 주소로 이동합니다. 허용 목록 밖의 사이트는 사용자 승인이 필요합니다.', parameters: {type: 'object', properties: {url: {type: 'string'}}, required: ['url'], additionalProperties: false}},
@@ -770,6 +784,11 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
           };
       const inferencePreview = JSON.stringify({
         status: displayedInference.status,
+        streamed: Boolean(displayedInference.streamed ||
+            displayedInference.status === 'streaming'),
+        stream_event_count: displayedInference.stream_event_count ||
+            modelStreamEvents.length,
+        retry_count: displayedInference.retry_count || 0,
         text: displayedInference.text || '',
         tool_calls: displayedInference.tool_calls || [],
         finish_reason: displayedInference.finish_reason || '',
@@ -801,7 +820,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
         </section>
         <section class="settings-card"><h2>실제 모델 응답 시험</h2>
           ${row('시험 프롬프트', '입력과 응답은 프로필 설정에 저장하지 않습니다.', `<div class="setting-control"><textarea class="text-input model-prompt" id="modelTestPromptInput" maxlength="65536" rows="3" spellcheck="false">${esc(modelTestPrompt)}</textarea></div>`)}
-          <div class="setting-row"><div class="setting-control"><button class="btn primary" id="testModelResponseButton" ${displayedAuthStatus.connected && displayedInference.status !== 'running' ? '' : 'disabled'}>응답 보내기</button><button class="btn" id="cancelModelResponseButton" ${displayedInference.status === 'running' ? '' : 'disabled'}>요청 취소</button></div><div class="validation ${displayedInference.status === 'error' ? 'error' : ''}" id="modelInferenceStatus" data-status="${esc(displayedInference.status)}">${esc(displayedInference.message)}</div></div>
+          <div class="setting-row"><div class="setting-control"><button class="btn primary" id="testModelResponseButton" ${displayedAuthStatus.connected && !['running','streaming'].includes(displayedInference.status) ? '' : 'disabled'}>응답 보내기</button><button class="btn" id="cancelModelResponseButton" ${['running','streaming'].includes(displayedInference.status) ? '' : 'disabled'}>요청 취소</button></div><div class="validation ${displayedInference.status === 'error' ? 'error' : ''}" id="modelInferenceStatus" data-status="${esc(displayedInference.status)}">${esc(displayedInference.message)}</div></div>
           <div class="setting-row"><pre class="code-preview" id="modelInferenceResult">${esc(inferencePreview)}</pre></div>
         </section>
         <section class="settings-card"><h2>생성·도구 설정</h2>
@@ -902,8 +921,12 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
             'prompt_injection' ? '경고' : mainFrame ? '관찰됨' : '대기';
     targetStatus.className = `chip ${mainFrame ?
         agentRuntime.observation?.status === 'prompt_injection' ? 'gate' : 'run' : ''}`;
-    setHtml($('#agentMessages'), agentRuntime.messages.map(message =>
-      `<article class="agent-message ${esc(message.role)}"><small>${message.role === 'user' ? '사용자' : message.role === 'assistant' ? profile.name : message.role === 'error' ? '실행 중단' : '안전 안내'}</small><p>${esc(message.text)}</p></article>`).join(''));
+    const streamMessage = agentRuntime.stream?.status === 'streaming' &&
+            (agentRuntime.stream.text || agentRuntime.stream.tool_calls?.length) ?
+        [{role: 'assistant streaming',
+          text: agentRuntime.stream.text || '도구 호출을 실시간으로 조립하고 있습니다.'}] : [];
+    setHtml($('#agentMessages'), agentRuntime.messages.concat(streamMessage).map(message =>
+      `<article class="agent-message ${esc(message.role)}"><small>${message.role === 'user' ? '사용자' : message.role.startsWith('assistant') ? profile.name : message.role === 'error' ? '실행 중단' : '안전 안내'}</small><p>${esc(message.text)}</p></article>`).join(''));
     const plan = $('#agentPlan');
     plan.hidden = !agentRuntime.plan.length;
     setHtml($('#agentPlanRows'), agentRuntime.plan.map(item =>
@@ -1177,6 +1200,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       return modelInference;
     }
     modelTestPrompt = prompt;
+    modelStreamEvents = [];
     modelInference = {
       key: selected.key, status: 'running', completed: false,
       message: `${runtime.selected_model.provider} 모델에 요청하고 있습니다.`,
@@ -1185,14 +1209,29 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     };
     renderSettings();
     try {
-      const result = await sendModelAuthRequest(
-          'mewebModelGenerate', runtime.selected_model.provider,
+      const result = await sendModelStreamRequest(
+          'mewebModelGenerate', event => {
+            modelStreamEvents.push(event);
+            modelStreamEvents = modelStreamEvents.slice(-500);
+            modelInference = {
+              ...modelInference, ...event, key: selected.key,
+              status: 'streaming', completed: false,
+              message: event.reset ?
+                  `연결 또는 속도 제한으로 ${event.retry_attempt}회 재시도합니다.` :
+                  `${runtime.selected_model.provider} 응답을 실시간으로 받고 있습니다.`,
+              stream_event_count: event.sequence,
+              retry_count: event.retry_attempt || 0,
+            };
+            renderSettings();
+          },
+          runtime.selected_model.provider,
           runtime.selected_model.authentication.method,
           runtime.selected_model.endpoint, runtime.selected_model.name,
           'MEWEB 연결 시험입니다. 안전 정책을 지키고 간결하게 응답하세요.',
           prompt, runtime.selected_model.max_output_tokens,
           runtime.selected_model.temperature, runtime.selected_model.tool_choice,
-          JSON.stringify(Array.isArray(tools) ? tools : []));
+          JSON.stringify(Array.isArray(tools) ? tools : []),
+          runtime.runtime.retry_limit_per_action);
       modelInference = {...result, key: selected.key};
       renderSettings();
       if (result?.completed) {
@@ -1285,8 +1324,21 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
 
   async function requestAgentDecision(goal, observation, transcript) {
     const runtime = effectiveModelRuntime();
-    return sendModelAuthRequest(
-        'mewebModelGenerate', runtime.selected_model.provider,
+    return sendModelStreamRequest(
+        'mewebModelGenerate', event => {
+          agentRuntime.stream = {
+            status: event.event === 'completed' ? 'completed' : 'streaming',
+            text: event.text || '',
+            tool_calls: event.tool_calls || [],
+            eventCount: event.sequence || 0,
+            retryCount: event.retry_attempt || 0,
+          };
+          agentRuntime.message = event.reset ?
+              `모델 연결을 ${event.retry_attempt}회 다시 시도합니다.` :
+              `모델 응답 수신 중 · ${event.sequence || 0}개 이벤트`;
+          renderAgentPanel();
+        },
+        runtime.selected_model.provider,
         runtime.selected_model.authentication.method,
         runtime.selected_model.endpoint, runtime.selected_model.name,
         AGENT_SYSTEM_INSTRUCTIONS, agentPrompt(goal, observation, transcript),
@@ -1294,7 +1346,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
         runtime.selected_model.temperature,
         runtime.selected_model.tool_choice === 'none' ? 'auto' :
             runtime.selected_model.tool_choice,
-        JSON.stringify(AGENT_TOOLS));
+        JSON.stringify(AGENT_TOOLS), runtime.runtime.retry_limit_per_action);
   }
 
   async function waitForAgentApproval(result, tool, argumentsValue, runId) {
@@ -1334,6 +1386,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     agentRuntime.status = status;
     agentRuntime.message = message;
     agentRuntime.pendingApproval = null;
+    agentRuntime.stream = {...agentRuntime.stream, status};
     agentRuntime.messages.push({role, text: message});
     setAgentPlan(5, status);
     renderAgentPanel();
@@ -1361,6 +1414,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
         {role: 'user', text: goal},
       ],
       plan: [], pendingApproval: null, actionCount: 0,
+      stream: {status: 'idle', text: '', tool_calls: [], eventCount: 0, retryCount: 0},
     };
     setAgentPlan(0);
     record('AI Agent 실행을 시작했습니다. 사용자 지시 원문은 저장하지 않았습니다.');
@@ -1395,6 +1449,11 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
           throw new Error(decision?.message || '모델이 다음 동작을 결정하지 못했습니다.');
         }
         retryCount = 0;
+        agentRuntime.stream = {
+          ...agentRuntime.stream, status: 'completed',
+          text: decision.text || agentRuntime.stream.text || '',
+          tool_calls: decision.tool_calls || agentRuntime.stream.tool_calls || [],
+        };
         if (decision.text) {
           agentRuntime.messages.push({role: 'assistant', text: decision.text});
         }
@@ -1628,6 +1687,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       generateModelResponse(prompt, tools),
     cancelModelResponse: () => cancelModelResponse(),
     getModelInference: () => JSON.parse(JSON.stringify(modelInference)),
+    getModelStreamEvents: () => JSON.parse(JSON.stringify(modelStreamEvents)),
     isAgentSidePanel: () => isAgentSidePanel,
     getAgentRuntime: () => JSON.parse(JSON.stringify({
       ...agentRuntime, pendingApproval: agentRuntime.pendingApproval ? {
