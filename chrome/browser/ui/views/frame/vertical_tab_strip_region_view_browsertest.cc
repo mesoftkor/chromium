@@ -47,6 +47,7 @@
 #include "ui/gfx/scoped_animation_duration_scale_mode.h"
 #include "ui/views/controls/button/button_controller.h"
 #include "ui/views/controls/button/label_button.h"
+#include "ui/views/controls/label.h"
 #include "ui/views/controls/resize_area.h"
 #include "ui/views/focus/focus_manager.h"
 
@@ -1131,12 +1132,18 @@ IN_PROC_BROWSER_TEST_F(VerticalTabStripRegionViewTest,
                        MewebSettingsFooterOpensWorkspaceSettings) {
   views::LabelButton* settings_button =
       region_view()->meweb_settings_button_for_testing();
+  views::Label* footer_label = region_view()->meweb_footer_label_for_testing();
   ASSERT_TRUE(settings_button);
-  EXPECT_NE(std::u16string::npos, settings_button->GetText().find(u"MEWEB"));
+  ASSERT_TRUE(footer_label);
+  EXPECT_NE(std::u16string::npos, footer_label->GetText().find(u"MEWEB"));
+  EXPECT_TRUE(settings_button->GetText().empty());
   EXPECT_FALSE(settings_button->GetImage(views::Button::STATE_NORMAL).isNull());
-  EXPECT_EQ(gfx::ALIGN_RIGHT, settings_button->GetHorizontalAlignment());
+  EXPECT_EQ(gfx::ALIGN_CENTER, settings_button->GetHorizontalAlignment());
   ASSERT_TRUE(settings_button->GetBorder());
   EXPECT_GT(settings_button->GetInsets().left(), 1);
+  EXPECT_FALSE(footer_label->GetBorder());
+  RunScheduledLayouts();
+  EXPECT_LT(footer_label->bounds().x(), settings_button->bounds().x());
 
   settings_button->button_controller()->NotifyClick();
   ASSERT_TRUE(base::test::RunUntil([&]() {
@@ -1150,7 +1157,7 @@ IN_PROC_BROWSER_TEST_F(VerticalTabStripRegionViewTest,
   state_controller()->RequestCollapse(true);
   ASSERT_TRUE(base::test::RunUntil(
       [&]() { return state_controller()->IsCollapsed(); }));
-  EXPECT_TRUE(settings_button->GetText().empty());
+  EXPECT_FALSE(footer_label->GetVisible());
 }
 
 IN_PROC_BROWSER_TEST_F(VerticalTabStripRegionViewTest,

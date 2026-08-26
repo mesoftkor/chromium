@@ -69,6 +69,7 @@
 #include "ui/views/border.h"
 #include "ui/views/controls/button/label_button.h"
 #include "ui/views/controls/focus_ring.h"
+#include "ui/views/controls/label.h"
 #include "ui/views/controls/resize_area.h"
 #include "ui/views/controls/separator.h"
 #include "ui/views/focus/focus_manager.h"
@@ -172,34 +173,48 @@ VerticalTabStripRegionView::VerticalTabStripRegionView(
   meweb_footer_separator_->SetProperty(
       views::kMarginsKey, gfx::Insets::VH(0, region_horizontal_padding));
 
-  auto meweb_settings_button = std::make_unique<views::LabelButton>(
-      base::BindRepeating(
+  auto meweb_footer = std::make_unique<views::View>();
+  meweb_footer_layout_ =
+      meweb_footer->SetLayoutManager(std::make_unique<views::FlexLayout>());
+  meweb_footer_layout_->SetOrientation(views::LayoutOrientation::kHorizontal)
+      .SetCrossAxisAlignment(views::LayoutAlignment::kCenter);
+
+  meweb_footer_label_ = meweb_footer->AddChildView(
+      std::make_unique<views::Label>(MewebSettingsLabel()));
+  meweb_footer_label_->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+  meweb_footer_label_->SetEnabledColor(kColorTabForegroundInactiveFrameActive);
+  meweb_footer_label_->SetProperty(
+      views::kFlexBehaviorKey,
+      views::FlexSpecification(views::MinimumFlexSizeRule::kScaleToZero,
+                               views::MaximumFlexSizeRule::kUnbounded));
+
+  auto meweb_settings_button =
+      std::make_unique<views::LabelButton>(base::BindRepeating(
           [](BrowserWindowInterface* browser) {
             browser->OpenGURL(GURL("chrome://new-tab-page/?meweb=settings"),
                               WindowOpenDisposition::NEW_FOREGROUND_TAB);
           },
-          browser_view->browser()),
-      MewebSettingsLabel());
+          browser_view->browser()));
   meweb_settings_button->SetImageModel(
       views::Button::STATE_NORMAL,
       ui::ImageModel::FromVectorIcon(vector_icons::kSettingsIcon,
                                      kColorTabForegroundInactiveFrameActive,
                                      kMewebSettingsIconSize));
-  meweb_settings_button->SetImageLabelSpacing(7);
-  meweb_settings_button->SetHorizontalAlignment(gfx::ALIGN_RIGHT);
-  meweb_settings_button->SetFocusRingCornerRadius(
-      kMewebSettingsCornerRadius);
+  meweb_settings_button->SetHorizontalAlignment(gfx::ALIGN_CENTER);
+  meweb_settings_button->SetFocusRingCornerRadius(kMewebSettingsCornerRadius);
   meweb_settings_button->SetBorder(views::CreatePaddedBorder(
-      views::CreateRoundedRectBorder(
-          1, kMewebSettingsCornerRadius,
-          kColorTabForegroundInactiveFrameActive),
+      views::CreateRoundedRectBorder(1, kMewebSettingsCornerRadius,
+                                     kColorTabForegroundInactiveFrameActive),
       gfx::Insets::VH(5, 7)));
   meweb_settings_button->SetTooltipText(u"MEWEB 환경설정 열기");
   meweb_settings_button->GetViewAccessibility().SetName(u"MEWEB 환경설정");
-  meweb_settings_button->SetProperty(
-      views::kMarginsKey, gfx::Insets::TLBR(6, region_horizontal_padding, 0,
-                                            region_horizontal_padding));
-  meweb_settings_button_ = AddChildView(std::move(meweb_settings_button));
+  meweb_settings_button_ =
+      meweb_footer->AddChildView(std::move(meweb_settings_button));
+
+  meweb_footer->SetProperty(views::kMarginsKey,
+                            gfx::Insets::TLBR(6, region_horizontal_padding, 0,
+                                              region_horizontal_padding));
+  meweb_footer_container_ = AddChildView(std::move(meweb_footer));
 
   gemini_button_ = AddChildView(std::make_unique<views::View>());
 
@@ -813,11 +828,10 @@ void VerticalTabStripRegionView::OnCollapseStateChanged(
   // the collapsing state.
   bool collapsed = state != tabs::VerticalTabStripCollapseState::kExpanded;
 
-  meweb_settings_button_->SetText(collapsed ? std::u16string()
-                                            : MewebSettingsLabel());
-  meweb_settings_button_->SetImageLabelSpacing(collapsed ? 0 : 7);
-  meweb_settings_button_->SetHorizontalAlignment(collapsed ? gfx::ALIGN_CENTER
-                                                           : gfx::ALIGN_RIGHT);
+  meweb_footer_label_->SetVisible(!collapsed);
+  meweb_footer_layout_->SetMainAxisAlignment(
+      collapsed ? views::LayoutAlignment::kCenter
+                : views::LayoutAlignment::kStart);
 
   resize_area_->SetVisible(!collapsed ||
                            !state_controller_->IsExpandOnHoverEnabled() ||
