@@ -174,7 +174,28 @@ std::string MewebSmartEditorScript(std::string_view request_json) {
       const request = JSON.parse()JS",
                        base::GetQuotedJSONString(request_json), R"JS();
       const fail = (status, message) => ({ok: false, status, message});
-      const findEditor = () => globalThis.SmartEditor?._editors?.blogpc001;
+      const hasDraftRecoveryPrompt = () => {
+        const pageText = String(document.body?.innerText || '')
+            .replace(/\s+/g, ' ').trim();
+        return /작성\s*중인\s*글이\s*있습니다/.test(pageText) &&
+            /이어서\s*작성하시겠습니까/.test(pageText);
+      };
+      if (hasDraftRecoveryPrompt()) {
+        return JSON.stringify(fail(
+            'draft_recovery_required',
+            '기존 작성 중인 글을 복구할지는 사용자가 직접 선택해야 합니다.'));
+      }
+      const findEditor = () => {
+        const candidate = globalThis.SmartEditor?._editors?.blogpc001;
+        const liveNaver = /(^|\.)naver\.com$/i.test(location.hostname);
+        if (liveNaver && (!candidate?._papyrus || !candidate?._historyService ||
+            !candidate?._virtualEditable ||
+            (typeof candidate?.isDocumentProcessing === 'function' &&
+             candidate.isDocumentProcessing()))) {
+          return null;
+        }
+        return candidate;
+      };
       let editor = findEditor();
       const readyDeadline = Date.now() + 30000;
       while (!editor && Date.now() < readyDeadline) {
@@ -185,6 +206,12 @@ std::string MewebSmartEditorScript(std::string_view request_json) {
         return JSON.stringify(fail(
             'editor_not_ready', 'SmartEditor ONE 편집기가 아직 준비되지 않았습니다.'));
       }
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      if (hasDraftRecoveryPrompt()) {
+        return JSON.stringify(fail(
+            'draft_recovery_required',
+            '기존 작성 중인 글을 복구할지는 사용자가 직접 선택해야 합니다.'));
+      }
       const owners = [editor, editor._documentModel, editor.documentModel]
           .filter(Boolean);
       const method = name => {
@@ -192,14 +219,74 @@ std::string MewebSmartEditorScript(std::string_view request_json) {
         return owner ? owner[name].bind(owner) : null;
       };
       const getDocumentData = method('getDocumentData') || method('getData');
+      const documentService = editor?._documentService;
       const setDocumentData = method('setDocumentData') || method('setData');
+      const componentType = component =>
+          String(component?.['@ctype'] || component?.ctype || '');
+      const paragraphText = paragraphs => (Array.isArray(paragraphs) ? paragraphs : [])
+          .map(paragraph => (Array.isArray(paragraph?.nodes) ? paragraph.nodes : [])
+              .map(node => String(node?.value || '')).join(''))
+          .join('\n');
+      const safeImage = image => ({
+        '@ctype': 'image',
+        src: String(image?.src || ''),
+        domain: String(image?.domain || ''),
+        path: String(image?.path || ''),
+        width: Number(image?.width || image?.originalWidth || 0),
+        height: Number(image?.height || image?.originalHeight || 0),
+        widthPercentage: Number(image?.widthPercentage || 100),
+        origin: {srcFrom: String(image?.origin?.srcFrom || 'local')},
+      });
+      const toSafeDocumentModel = model => {
+        const source = Array.isArray(model?.document?.components) ?
+            model.document.components :
+            (Array.isArray(model?.components) ? model.components : []);
+        const components = source.map(component => {
+          const type = componentType(component);
+          if (type === 'documentTitle') {
+            return {
+              '@ctype': type,
+              text: component?.text === undefined ?
+                  paragraphText(component?.title) : String(component.text),
+            };
+          }
+          if (type === 'quotation') {
+            return {
+              '@ctype': type,
+              text: component?.text === undefined ?
+                  paragraphText(component?.value) : String(component.text),
+            };
+          }
+          if (type === 'text') {
+            return {
+              '@ctype': type,
+              paragraphs: Array.isArray(component?.paragraphs) ?
+                  component.paragraphs.map(value => String(value)) :
+                  (Array.isArray(component?.value) ? component.value.map(
+                      paragraph => paragraphText([paragraph])) : []),
+            };
+          }
+          if (type === 'image') return safeImage(component);
+          if (type === 'imageGroup') {
+            return {
+              '@ctype': type,
+              images: (Array.isArray(component?.images) ? component.images : [])
+                  .filter(image => componentType(image) === 'image')
+                  .map(safeImage),
+            };
+          }
+          return null;
+        }).filter(Boolean);
+        return {components};
+      };
       const summarize = model => {
-        const components = Array.isArray(model?.components) ? model.components : [];
-        const types = components.map(component => String(component?.['@ctype'] || ''));
+        const components = toSafeDocumentModel(model).components;
+        const types = components.map(component => componentType(component));
         const countNestedImages = component => {
-          if (component?.['@ctype'] === 'image') return 1;
-          if (component?.['@ctype'] === 'imageGroup' && Array.isArray(component.images)) {
-            return component.images.filter(image => image?.['@ctype'] === 'image').length;
+          if (componentType(component) === 'image') return 1;
+          if (componentType(component) === 'imageGroup' && Array.isArray(component.images)) {
+            return component.images.filter(
+                image => componentType(image) === 'image').length;
           }
           return 0;
         };
@@ -211,6 +298,107 @@ std::string MewebSmartEditorScript(std::string_view request_json) {
           image_count: components.reduce(
               (count, component) => count + countNestedImages(component), 0),
         };
+      };
+      const documentsMatch = (actual, expected) => {
+        const actualComponents = toSafeDocumentModel(actual).components;
+        const expectedComponents = toSafeDocumentModel(expected).components;
+        const actualTitle = actualComponents.find(
+            component => componentType(component) === 'documentTitle')?.text || '';
+        const expectedTitle = expectedComponents.find(
+            component => componentType(component) === 'documentTitle')?.text || '';
+        const actualText = actualComponents.filter(
+            component => componentType(component) === 'text')
+            .flatMap(component => component.paragraphs).join('\n');
+        const expectedText = expectedComponents.filter(
+            component => componentType(component) === 'text')
+            .flatMap(component => component.paragraphs).join('\n');
+        const actualSummary = summarize(actual);
+        const expectedSummary = summarize(expected);
+        return actualTitle === expectedTitle && actualText === expectedText &&
+            actualSummary.image_count === expectedSummary.image_count;
+      };
+      const newComponentId = () => `SE-${globalThis.crypto?.randomUUID?.() ||
+          `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+      const cloneParagraph = (template, value) => {
+        const paragraph = structuredClone(template || {
+          '@ctype': 'paragraph', nodes: [{'@ctype': 'textNode', value: ''}]
+        });
+        paragraph.id = newComponentId();
+        paragraph['@ctype'] = paragraph['@ctype'] || 'paragraph';
+        const nodeTemplate = Array.isArray(paragraph.nodes) ? paragraph.nodes[0] : null;
+        const node = structuredClone(nodeTemplate || {'@ctype': 'textNode'});
+        node.id = newComponentId();
+        node['@ctype'] = node['@ctype'] || 'textNode';
+        node.value = String(value || '');
+        paragraph.nodes = [node];
+        return paragraph;
+      };
+      const toLiveDocumentModel = (safeModel, currentModel) => {
+        if (!Array.isArray(currentModel?.document?.components)) return safeModel;
+        const requested = toSafeDocumentModel(safeModel).components;
+        if (requested.some(component => ![
+          'documentTitle', 'text', 'image'
+        ].includes(componentType(component)))) {
+          throw new Error('unsupported_live_component');
+        }
+        const currentComponents = currentModel.document.components;
+        const currentTitle = currentComponents.find(
+            component => componentType(component) === 'documentTitle');
+        const currentText = currentComponents.find(
+            component => componentType(component) === 'text');
+        const title = requested.find(
+            component => componentType(component) === 'documentTitle');
+        const texts = requested.filter(component => componentType(component) === 'text');
+        if (!currentTitle || !currentText || !title || !texts.length) {
+          throw new Error('missing_live_template');
+        }
+        const titleComponent = structuredClone(currentTitle);
+        titleComponent.title = [cloneParagraph(
+            currentTitle.title?.[0], title.text)];
+        const textTemplate = currentText.value?.[0];
+        const textComponents = texts.map((component, index) => {
+          const textComponent = structuredClone(index === 0 ? currentText : currentText);
+          if (index > 0) textComponent.id = newComponentId();
+          textComponent.value = component.paragraphs.map(
+              value => cloneParagraph(textTemplate, value));
+          return textComponent;
+        });
+        const componentFactory = documentService?._componentFactory;
+        const images = requested.filter(component => componentType(component) === 'image');
+        const imageComponents = images.map(image => {
+          if (!componentFactory ||
+              typeof componentFactory.createComponentWithCompData !== 'function' ||
+              typeof documentService?.revertComponent !== 'function') {
+            throw new Error('missing_image_factory');
+          }
+          const resourceUrl = new URL(image.src);
+          const imageStore = componentFactory.createComponentWithCompData({
+            ctype: 'image',
+            domain: resourceUrl.origin,
+            path: `${resourceUrl.pathname}${resourceUrl.search}`,
+            src: image.src,
+            width: image.width,
+            height: image.height,
+            originalWidth: image.width,
+            originalHeight: image.height,
+            fileName: decodeURIComponent(
+                resourceUrl.pathname.split('/').filter(Boolean).pop() ||
+                'meweb-image'),
+            internalResource: true,
+            widthPercentage: image.widthPercentage || 100,
+            phase: 'done',
+            origin: {
+              ctype: 'imageOrigin',
+              srcFrom: image.origin?.srcFrom || 'local',
+            },
+          });
+          return documentService.revertComponent(imageStore.toPlainJSON());
+        });
+        const liveModel = structuredClone(currentModel);
+        liveModel.document.components = [
+          titleComponent, ...textComponents, ...imageComponents
+        ];
+        return liveModel;
       };
       if (request.tool === 'inspect_editor') {
         let documentModel = null;
@@ -247,44 +435,106 @@ std::string MewebSmartEditorScript(std::string_view request_json) {
           return JSON.stringify(fail(
               'invalid_arguments', '업로드 이미지는 한 번에 1~10개여야 합니다.'));
         }
-        const files = images.map(image => {
-          const binary = atob(String(image.data_base64 || ''));
-          const bytes = new Uint8Array(binary.length);
-          for (let index = 0; index < binary.length; ++index) {
-            bytes[index] = binary.charCodeAt(index);
-          }
-          return new File([bytes], String(image.name || 'meweb-image'), {
-            type: String(image.mime_type || 'application/octet-stream'),
-            lastModified: Date.now(),
+        let files;
+        try {
+          files = images.map(image => {
+            const binary = atob(String(image.data_base64 || ''));
+            const bytes = new Uint8Array(binary.length);
+            for (let index = 0; index < binary.length; ++index) {
+              bytes[index] = binary.charCodeAt(index);
+            }
+            return new File([bytes], String(image.name || 'meweb-image'), {
+              type: String(image.mime_type || 'application/octet-stream'),
+              lastModified: Date.now(),
+            });
           });
-        });
-        const ids = images.map((image, index) =>
-          String(image.id || `meweb-${Date.now()}-${index}`));
-        const sourceList = service.createSourceList(ids, files);
-        const uploadedValue = await Promise.race([
-          Promise.resolve(service.uploadImagesFromFiles(sourceList)),
-          new Promise((_, reject) => setTimeout(
-              () => reject(new Error('image upload timeout')), 60000)),
-        ]);
+        } catch (_) {
+          return JSON.stringify(fail(
+              'image_decode_failed', 'SmartEditor 이미지 파일을 만들지 못했습니다.'));
+        }
+        const attachmentIds = images.map((image, index) =>
+          String(image.id || `meweb-attachment-${index}`));
+        const sourceIds = images.map((_, index) =>
+          `meweb-${Date.now()}-${index}-${Math.random().toString(36).slice(2)}`);
+        let sourceList;
+        try {
+          sourceList = service.createSourceList(sourceIds, files);
+        } catch (_) {
+          return JSON.stringify(fail(
+              'image_source_failed', 'SmartEditor 이미지 소스를 만들지 못했습니다.'));
+        }
+        let pendingUploads;
+        const uploadStartDeadline = Date.now() + 30000;
+        while (!pendingUploads && Date.now() < uploadStartDeadline) {
+          try {
+            pendingUploads = service.uploadImagesFromFiles(sourceList);
+          } catch (_) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+        }
+        if (!pendingUploads) {
+          return JSON.stringify(fail(
+              'image_upload_start_failed', 'SmartEditor 이미지 업로드를 시작하지 못했습니다.'));
+        }
+        const resolveUploads = async value => {
+          let current = Array.isArray(value) ? value : [value];
+          for (let depth = 0; depth < 5; ++depth) {
+            current = (await Promise.all(
+                current.map(upload => Promise.resolve(upload))))
+                .flatMap(upload => Array.isArray(upload) ? upload : [upload]);
+            if (current.every(upload =>
+                !Array.isArray(upload) &&
+                typeof upload?.then !== 'function')) {
+              return current;
+            }
+          }
+          throw new Error('nested image upload result');
+        };
+        const uploadPromise = resolveUploads(pendingUploads);
+        let uploadedValue;
+        try {
+          uploadedValue = await Promise.race([
+            uploadPromise,
+            new Promise((_, reject) => setTimeout(
+                () => reject(new Error('image upload timeout')), 60000)),
+          ]);
+        } catch (_) {
+          return JSON.stringify(fail(
+              'image_upload_rejected', 'SmartEditor 이미지 업로드가 거부됐습니다.'));
+        }
         const uploaded = Array.isArray(uploadedValue) ? uploadedValue :
             Array.isArray(uploadedValue?.images) ? uploadedValue.images :
             Array.isArray(uploadedValue?.resources) ? uploadedValue.resources :
             uploadedValue ? [uploadedValue] : [];
-        const resources = uploaded.map((value, index) => {
-          const resource = value?.resource || value || {};
-          const domain = String(resource.domain || '');
-          const path = String(resource.path || '');
-          return {
-            id: ids[index] || '',
-            name: images[index]?.name || '',
-            domain,
-            path,
-            width: Number(resource.width || 0),
-            height: Number(resource.height || 0),
-            src: String(resource.src ||
-                (domain && path ? `https://${domain}${path}` : '')),
-          };
-        }).filter(resource => resource.src || (resource.domain && resource.path));
+        let resources;
+        try {
+          resources = uploaded.map((value, index) => {
+            const resource = value?.response?.resource || value?.response ||
+                value?.resource || value || {};
+            const domain = String(resource.domain || '');
+            const path = String(resource.path || '');
+            const resourceUrl = String(resource.url || '');
+            const resourcePath = resourceUrl || path;
+            const origin = /^https?:\/\//i.test(domain) ? domain :
+                (domain ? `https://${domain}` : '');
+            const joinedPath = resourcePath && !resourcePath.startsWith('/') ?
+                `/${resourcePath}` : resourcePath;
+            return {
+              id: attachmentIds[index] || '',
+              name: images[index]?.name || '',
+              domain,
+              path,
+              width: Number(resource.width || 0),
+              height: Number(resource.height || 0),
+              src: String(resource.src ||
+                  (origin && joinedPath ? `${origin}${joinedPath}` : '')),
+            };
+          }).filter(resource => resource.src ||
+              (resource.domain && resource.path));
+        } catch (_) {
+          return JSON.stringify(fail(
+              'image_response_failed', 'SmartEditor 이미지 응답을 정규화하지 못했습니다.'));
+        }
         if (resources.length !== files.length) {
           return JSON.stringify(fail(
               'upload_failed', 'SmartEditor가 모든 이미지 리소스를 반환하지 않았습니다.'));
@@ -302,8 +552,8 @@ std::string MewebSmartEditorScript(std::string_view request_json) {
           return JSON.stringify(fail(
               'unsupported_editor', 'SmartEditor 문서 모델 왕복 연결을 찾을 수 없습니다.'));
         }
-        const model = request.arguments?.document_model;
-        const components = Array.isArray(model?.components) ? model.components : [];
+        const model = toSafeDocumentModel(request.arguments?.document_model);
+        const components = model.components;
         const allowed = new Set([
           'documentTitle', 'quotation', 'text', 'image', 'imageGroup'
         ]);
@@ -312,11 +562,32 @@ std::string MewebSmartEditorScript(std::string_view request_json) {
           return JSON.stringify(fail(
               'invalid_document', '허용되지 않은 SmartEditor 문서 컴포넌트입니다.'));
         }
-        await Promise.resolve(setDocumentData(
-            model, request.arguments?.population_params || {}));
-        const normalized = await Promise.resolve(getDocumentData());
+        let liveModel;
+        try {
+          const current = await Promise.resolve(getDocumentData());
+          liveModel = toLiveDocumentModel(model, current);
+        } catch (_) {
+          return JSON.stringify(fail(
+              'live_schema_failed', 'SmartEditor 문서 형식 변환에 실패했습니다.'));
+        }
+        try {
+          await Promise.resolve(setDocumentData(
+              liveModel, request.arguments?.population_params || {}));
+        } catch (_) {
+          return JSON.stringify(fail(
+              'set_document_failed', 'SmartEditor 문서 반영에 실패했습니다.'));
+        }
+        const roundtripDeadline = Date.now() + 30000;
+        let normalizedRaw = await Promise.resolve(getDocumentData());
+        while (!documentsMatch(normalizedRaw, model) &&
+               Date.now() < roundtripDeadline) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+          normalizedRaw = await Promise.resolve(getDocumentData());
+        }
+        const normalized = toSafeDocumentModel(normalizedRaw);
         const summary = summarize(normalized);
-        if (summary.title_count !== 1 || summary.text_count < 1) {
+        if (!documentsMatch(normalized, model) || summary.title_count !== 1 ||
+            summary.text_count < 1) {
           return JSON.stringify(fail(
               'roundtrip_failed', '정규화된 문서에서 제목 또는 본문을 확인할 수 없습니다.'));
         }

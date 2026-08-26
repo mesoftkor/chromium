@@ -563,7 +563,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
   };
   const AGENT_TOOLS = [
     {name: 'navigate', description: '활성 탭을 HTTP 또는 HTTPS 주소로 이동합니다. 허용 목록 밖의 사이트는 사용자 승인이 필요합니다.', parameters: {type: 'object', properties: {url: {type: 'string'}}, required: ['url'], additionalProperties: false}},
-    {name: 'click', description: '가장 최근 DOM 관찰에서 받은 참조값의 요소를 클릭합니다. 발행·게시·임시저장 클릭은 실행 계층에서 차단됩니다.', parameters: {type: 'object', properties: {frame_index: {type: 'integer'}, ref: {type: 'string'}}, required: ['frame_index', 'ref'], additionalProperties: false}},
+    {name: 'click', description: '가장 최근 DOM 관찰에서 받은 참조값의 요소를 클릭합니다. 발행·게시·임시저장과 기존 작성글 복구 선택은 실행 계층에서 차단됩니다.', parameters: {type: 'object', properties: {frame_index: {type: 'integer'}, ref: {type: 'string'}}, required: ['frame_index', 'ref'], additionalProperties: false}},
     {name: 'type', description: '가장 최근 DOM 관찰에서 받은 입력 요소에 문자를 입력합니다.', parameters: {type: 'object', properties: {frame_index: {type: 'integer'}, ref: {type: 'string'}, text: {type: 'string'}}, required: ['frame_index', 'ref', 'text'], additionalProperties: false}},
     {name: 'scroll', description: '현재 프레임을 지정한 픽셀만큼 스크롤합니다.', parameters: {type: 'object', properties: {frame_index: {type: 'integer'}, x: {type: 'number'}, y: {type: 'number'}}, required: ['frame_index', 'y'], additionalProperties: false}},
     {name: 'inspect_editor', description: 'SmartEditor ONE 프레임의 documentModel get/set 및 이미지 업로드 연결 상태를 검사합니다. SmartEditor 프레임을 관찰한 직후 먼저 호출합니다.', parameters: {type: 'object', properties: {frame_index: {type: 'integer'}}, required: ['frame_index'], additionalProperties: false}},
@@ -1281,6 +1281,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
 매 회차 제공되는 최신 DOM 관찰의 frame_index와 ref만 사용한다. 존재하지 않는 요소나 완료 상태를 추측하지 않는다.
 짧은 계획으로 한 번에 도구 하나만 호출하고, 실행 뒤 반드시 다시 관찰해 결과를 검증한다.
 로그인, 캡차, 결제, 외부 전송, 삭제 또는 허용 목록 밖 이동은 ask_user로 멈춘다.
+네이버가 기존 작성 중인 글을 이어서 작성할지 묻는 복구 팝업을 표시하면 이어서 작성과 취소를 자동 선택하지 말고 ask_user로 멈춘다. 사용자가 직접 선택한 뒤 반드시 페이지를 다시 관찰한다.
 발행, 게시, 예약 발행, 임시저장 버튼은 어떤 경우에도 클릭하지 않는다. 초안이 화면에 반영됐음을 확인하면 finish의 READY_FOR_REVIEW로 종료한다.
 SmartEditor ONE 프레임을 발견하면 일반 DOM 입력 대신 inspect_editor로 준비 상태를 확인한다. 사용자가 첨부한 이미지는 upload_images로 업로드하고 반환된 리소스로 document_model을 만든 뒤 set_document 왕복 결과를 검증한다.
 목표를 달성했거나 안전하게 더 진행할 수 없을 때만 finish 또는 ask_user를 호출한다.`;
@@ -1326,7 +1327,7 @@ SmartEditor ONE 프레임을 발견하면 일반 DOM 입력 대신 inspect_edito
       status: observation.status,
       frames: (observation.frames || []).map(frame => ({
         frame_index: frame.frame_index,
-        url: frame.url,
+        url: frame.frame_url || frame.url,
         title: frame.title,
         login_form_detected: Boolean(frame.login_form_detected),
         text: String(frame.text || '').slice(0, 9000),
@@ -1588,9 +1589,12 @@ SmartEditor ONE 프레임을 발견하면 일반 DOM 입력 대신 inspect_edito
         const auditSummary = result?.summary ? ` · ${result.summary}` : '';
         record(`AI Agent 도구 실행: ${call.name} · ${result?.status || 'unknown'}${auditSummary}`);
         if (!result?.ok) {
-          if (result?.status === 'login_required') {
+          if (result?.status === 'login_required' ||
+              result?.status === 'draft_recovery_required') {
             completeAgent('USER_ACTION_REQUIRED', result.message, 'system');
-            record('AI Agent가 로그인 자격 증명 또는 제출 동작 전에 중단했습니다.');
+            record(result.status === 'draft_recovery_required' ?
+                'AI Agent가 기존 작성글 복구 선택 전에 중단했습니다.' :
+                'AI Agent가 로그인 자격 증명 또는 제출 동작 전에 중단했습니다.');
             return true;
           }
           if (result?.status === 'publish_blocked') {

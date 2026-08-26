@@ -1575,6 +1575,10 @@ class MewebAgentWorkspaceHandler
         }
         const label = clean(node.getAttribute('aria-label') || node.title || node.innerText ||
                             node.getAttribute('placeholder') || node.value);
+        const pageText = clean(document.body?.innerText);
+        const hasDraftRecoveryPrompt =
+            /작성\s*중인\s*글이\s*있습니다/.test(pageText) &&
+            /이어서\s*작성하시겠습니까/.test(pageText);
         const inputType = clean(node.getAttribute('type')).toLowerCase();
         const autocomplete = clean(node.getAttribute('autocomplete')).toLowerCase();
         if (')JS",
@@ -1606,6 +1610,9 @@ class MewebAgentWorkspaceHandler
             'input[type="password"],input[autocomplete="current-password"],input[autocomplete="new-password"]'));
         if (/(로그인|sign\s*in|log\s*in)/i.test(label) || submitsLoginForm) {
           return {ok: false, status: 'login_required', message: '로그인은 사용자가 직접 완료해야 합니다.', summary: label};
+        }
+        if (hasDraftRecoveryPrompt && /(이어서\s*작성|취소|닫기)/.test(label)) {
+          return {ok: false, status: 'draft_recovery_required', message: '기존 작성 중인 글을 복구할지는 사용자가 직접 선택해야 합니다.', summary: label};
         }
         if (/(발행|게시|publish|예약\s*발행|임시\s*저장)/i.test(label)) {
           return {ok: false, status: 'publish_blocked', message: '발행·게시·임시저장 동작은 에이전트가 실행할 수 없습니다.', summary: label};
