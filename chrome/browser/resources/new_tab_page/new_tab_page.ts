@@ -486,6 +486,8 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       security: {
         credentials_persisted: false,
         oauth_access_tokens_memory_only: true,
+        macos_keychain_opt_in_available: true,
+        keychain_persistence_requires_explicit_opt_in: true,
         python_runtime_required: false,
         cloud_endpoints_locked: true,
         local_endpoint_loopback_only: true,
@@ -534,6 +536,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
   let state = loadState();
   let modelAuthConnection = {
     key: '', status: 'unknown', connected: false,
+    credentialPersisted: false, keychainAvailable: true,
     message: '연결 상태를 확인하지 않았습니다.',
   };
   let modelInference = {
@@ -765,18 +768,19 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
             'OpenAI 조직의 Identity Provider와 서비스 계정 매핑을 사용합니다. 일반 OpenAI 사용자 계정 로그인은 API에서 제공되지 않습니다.' :
             'Anthropic 조직의 Federation Rule과 서비스 계정 매핑을 사용합니다.';
       } else if (state.model.authenticationMethod === 'cli_oauth') {
-        authenticationHelp = 'Anthropic 공식 ant auth login 후 ant auth print-credentials --access-token으로 받은 단기 토큰을 현재 앱 세션에 연결합니다.';
+        authenticationHelp = 'Anthropic 공식 ant auth login 후 ant auth print-credentials --access-token으로 받은 단기 토큰을 기본적으로 현재 앱 세션에 연결합니다.';
       } else if (state.model.authenticationMethod === 'oauth_access_token') {
-        authenticationHelp = 'Google OAuth 데스크톱 앱 흐름에서 발급한 액세스 토큰을 현재 앱 세션에만 연결합니다.';
+        authenticationHelp = 'Google OAuth 데스크톱 앱 흐름에서 발급한 액세스 토큰을 기본적으로 현재 앱 세션에 연결합니다.';
       } else if (state.model.authenticationMethod === 'oauth_pkce') {
-        authenticationHelp = 'OpenRouter 공식 PKCE 흐름이 반환한 사용자 제어 API 키를 현재 앱 세션에 연결합니다.';
+        authenticationHelp = 'OpenRouter 공식 PKCE 흐름이 반환한 사용자 제어 API 키를 기본적으로 현재 앱 세션에 연결합니다.';
       } else if (state.model.authenticationMethod === 'api_key') {
-        authenticationHelp = `${selectedProfile.credentialReference} 또는 아래 입력값을 C++23 네이티브 브로커가 현재 앱 세션 메모리에서만 사용합니다.`;
+        authenticationHelp = `${selectedProfile.credentialReference} 또는 아래 입력값을 C++23 네이티브 브로커가 기본적으로 현재 앱 세션 메모리에서만 사용합니다.`;
       }
       const authKey = `${selectedProfile.provider}/${state.model.authenticationMethod}`;
       const displayedAuthStatus = modelAuthConnection.key === authKey ?
           modelAuthConnection : {
             status: 'unknown', connected: false,
+            credentialPersisted: false, keychainAvailable: true,
             message: '연결 상태를 확인하지 않았습니다.',
           };
       const displayedInference = modelInference.key === authKey ?
@@ -818,9 +822,9 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
         </section>
         <section class="settings-card" data-model-authentication="${esc(selectedProfile.provider)}"><h2>공급자 로그인</h2>
           ${row('인증 방식', 'OpenAI와 Anthropic은 공식 지원 방식만 사용합니다.', optionGroup('model.authenticationMethod', authenticationOptions))}
-          <div class="setting-row"><div class="note"><b>${esc(authenticationMethod.label)} · 비밀값은 Chromium Preferences와 localStorage에 저장하지 않습니다.</b><br>${esc(authenticationHelp)}</div></div>
-          ${row('네이티브 연결', 'Python 없이 Chromium C++23 브로커가 검증합니다.', `<div class="setting-control">${needsCredentialInput ? `<input class="text-input" type="password" id="modelCredentialInput" maxlength="16384" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="${esc(credentialPlaceholder)}">` : ''}<button class="btn primary" id="connectModelProviderButton">연결</button><button class="btn" id="checkModelProviderButton">상태 확인</button><button class="btn" id="disconnectModelProviderButton" ${displayedAuthStatus.connected ? '' : 'disabled'}>연결 해제</button></div>`)}
-          <div class="setting-row"><div class="validation ${displayedAuthStatus.status === 'error' ? 'error' : ''}" id="modelAuthStatus" data-status="${esc(displayedAuthStatus.status)}">${esc(displayedAuthStatus.message)}</div></div>
+          <div class="setting-row"><div class="note"><b>${esc(authenticationMethod.label)} · 비밀값은 Chromium Preferences와 localStorage에 저장하지 않습니다.</b><br>${esc(authenticationHelp)}${needsCredentialInput ? '<br>기본값은 메모리 전용이며, 연결할 때 선택하면 macOS 키체인에만 저장합니다.' : ''}</div></div>
+          ${row('네이티브 연결', 'Python 없이 Chromium C++23 브로커가 검증합니다.', `<div class="setting-control">${needsCredentialInput ? `<input class="text-input" type="password" id="modelCredentialInput" maxlength="16384" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="${esc(credentialPlaceholder)}"><label class="check"><input type="checkbox" id="modelCredentialPersistenceInput"> macOS 키체인에 저장</label>` : ''}<button class="btn primary" id="connectModelProviderButton">연결</button><button class="btn" id="checkModelProviderButton">상태 확인</button><button class="btn" id="disconnectModelProviderButton" ${displayedAuthStatus.connected ? '' : 'disabled'}>연결·저장 삭제</button></div>`)}
+          <div class="setting-row"><div class="validation ${displayedAuthStatus.status.includes('error') ? 'error' : ''}" id="modelAuthStatus" data-status="${esc(displayedAuthStatus.status)}">${esc(displayedAuthStatus.message)}</div></div>
         </section>
         <section class="settings-card"><h2>실제 모델 응답 시험</h2>
           ${row('시험 프롬프트', '입력과 응답은 프로필 설정에 저장하지 않습니다.', `<div class="setting-control"><textarea class="text-input model-prompt" id="modelTestPromptInput" maxlength="65536" rows="3" spellcheck="false">${esc(modelTestPrompt)}</textarea></div>`)}
@@ -1128,6 +1132,9 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       key: selected.key,
       status: result.status || 'error',
       connected: result.connected === true,
+      credentialPersisted:
+          result.credential_persisted_by_meweb === true,
+      keychainAvailable: result.keychain_available === true,
       message: result.message || '공급자 연결 결과가 없습니다.',
     };
     renderSettings();
@@ -1153,17 +1160,20 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
   async function connectModelProvider() {
     const selected = selectedAuthentication();
     const input = $('#modelCredentialInput');
+    const persistenceInput = $('#modelCredentialPersistenceInput');
     const credential = input?.value || '';
+    const persistenceRequested = persistenceInput?.checked === true;
     if (input) input.value = '';
     modelAuthConnection = {
       key: selected.key, status: 'connecting', connected: false,
+      credentialPersisted: false, keychainAvailable: true,
       message: '공급자 연결과 자격 증명을 검증하고 있습니다.',
     };
     renderSettings();
     try {
       const result = await sendModelAuthRequest(
           'mewebModelAuthConnect', selected.provider, selected.method,
-          credential, selected.endpoint);
+          credential, selected.endpoint, persistenceRequested);
       applyModelAuthResult(result);
       if (result?.connected) {
         record(`AI 모델 공급자를 네이티브 브로커에 연결했습니다: ${selected.key}`);
@@ -1187,8 +1197,8 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       const result = await sendModelAuthRequest(
           'mewebModelAuthDisconnect', selected.provider, selected.method);
       applyModelAuthResult(result);
-      record(`AI 모델 공급자의 메모리 연결을 해제했습니다: ${selected.key}`);
-      toast('모델 공급자 연결을 해제했습니다.');
+      record(`AI 모델 공급자의 연결과 저장된 자격 증명을 삭제했습니다: ${selected.key}`);
+      toast('모델 공급자 연결과 저장 정보를 삭제했습니다.');
       return result;
     } catch (_error) {
       return null;
@@ -1798,9 +1808,13 @@ SmartEditor ONE 프레임을 발견하면 일반 DOM 입력 대신 inspect_edito
     setAutonomy: value => { state.persona.autonomy = value; state.task.decisions = {}; save(); renderAll(); },
     getModelRuntimeConfig: () => JSON.parse(JSON.stringify(effectiveModelRuntime())),
     getModelAuthStatus: () => JSON.parse(JSON.stringify(modelAuthConnection)),
-    connectModelProvider: credential => {
+    connectModelProvider: (credential, persistInKeychain = false) => {
       const input = $('#modelCredentialInput');
       if (input) input.value = credential || '';
+      const persistenceInput = $('#modelCredentialPersistenceInput');
+      if (persistenceInput) {
+        persistenceInput.checked = persistInKeychain === true;
+      }
       return connectModelProvider();
     },
     checkModelProviderConnection: () => checkModelProviderConnection(),

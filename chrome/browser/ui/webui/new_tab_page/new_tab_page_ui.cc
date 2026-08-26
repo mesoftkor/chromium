@@ -35,6 +35,7 @@
 #include "base/supports_user_data.h"
 #include "base/task/sequenced_task_runner.h"
 #include "base/time/time.h"
+#include "base/uuid.h"
 #include "base/values.h"
 #include "build/branding_buildflags.h"
 #include "build/build_config.h"
@@ -142,8 +143,8 @@
 #include "google_apis/gaia/core_account_id.h"
 #include "media/base/media_switches.h"
 #include "mojo/public/cpp/base/big_buffer.h"
-#include "mojo/public/cpp/bindings/callback_helpers.h"
 #include "mojo/public/cpp/bindings/associated_remote.h"
+#include "mojo/public/cpp/bindings/callback_helpers.h"
 #include "net/base/net_errors.h"
 #include "net/base/url_util.h"
 #include "net/http/http_request_headers.h"
@@ -171,6 +172,10 @@
 #include "ui/webui/webui_util.h"
 #include "url/origin.h"
 #include "url/url_util.h"
+
+#if BUILDFLAG(IS_MAC)
+#include "chrome/browser/ui/webui/new_tab_page/meweb_model_auth_keychain.h"
+#endif
 
 #if !BUILDFLAG(IS_ANDROID)
 #include "chrome/browser/ui/browser_window.h"
@@ -226,6 +231,8 @@ namespace {
 
 constexpr char kPrevNavigationTimePrefName[] = "NewTabPage.PrevNavigationTime";
 constexpr char kMewebAgentWorkspaceStatePref[] = "meweb.agent_workspace_state";
+constexpr char kMewebModelAuthKeychainNamespacePref[] =
+    "meweb.model_auth_keychain_namespace";
 constexpr size_t kMaxMewebAgentWorkspaceStateBytes = 512 * 1024;
 constexpr size_t kMaxMewebModelAuthResponseBytes = 256 * 1024;
 constexpr size_t kMaxMewebModelInferenceResponseBytes = 1024 * 1024;
@@ -249,6 +256,7 @@ constexpr char kAIMThreadsVisibilityMode[] = "3";
 struct MewebMemoryCredential {
   std::string value;
   base::Time expires_at;
+  bool persisted_in_keychain = false;
 };
 
 class MewebMemoryCredentialStore : public base::SupportsUserData::Data {
@@ -367,6 +375,86 @@ class MewebAgentWorkspaceHandler
   static std::string CredentialKey(std::string_view provider,
                                    std::string_view method) {
     return base::StrCat({provider, "/", method});
+  }
+
+  static bool CanPersistCredential(std::string_view method) {
+    return method != "none" && method != "oauth_wif";
+  }
+
+  std::string KeychainNamespace(bool create_if_missing) {
+    PrefService* prefs = profile_->GetPrefs();
+    const std::string existing =
+        prefs->GetString(kMewebModelAuthKeychainNamespacePref);
+    if (base::Uuid::ParseLowercase(existing).is_valid()) {
+      return existing;
+    }
+    if (!create_if_missing) {
+      return std::string();
+    }
+    const std::string generated =
+        base::Uuid::GenerateRandomV4().AsLowercaseString();
+    prefs->SetString(kMewebModelAuthKeychainNamespacePref, generated);
+    return generated;
+  }
+
+  std::string KeychainAccount(std::string_view provider,
+                              std::string_view method,
+                              bool create_namespace) {
+    const std::string keychain_namespace = KeychainNamespace(create_namespace);
+    return keychain_namespace.empty()
+               ? std::string()
+               : base::StrCat({keychain_namespace, "/",
+                               CredentialKey(provider, method)});
+  }
+
+  enum class CredentialLookupStatus {
+    kConnected,
+    kDisconnected,
+    kKeychainError,
+  };
+
+  CredentialLookupStatus EnsureCredentialLoaded(std::string_view provider,
+                                                std::string_view method,
+                                                bool* persisted) {
+    const std::string key = CredentialKey(provider, method);
+    auto& credentials = Credentials();
+    auto credential = credentials.find(key);
+    if (credential != credentials.end() &&
+        (credential->second.expires_at.is_max() ||
+         credential->second.expires_at > base::Time::Now())) {
+      *persisted = credential->second.persisted_in_keychain;
+      return CredentialLookupStatus::kConnected;
+    }
+    if (credential != credentials.end()) {
+      credentials.erase(credential);
+    }
+    *persisted = false;
+    if (!CanPersistCredential(method)) {
+      return CredentialLookupStatus::kDisconnected;
+    }
+#if BUILDFLAG(IS_MAC)
+    const std::string account =
+        KeychainAccount(provider, method, /*create_namespace=*/false);
+    if (account.empty()) {
+      return CredentialLookupStatus::kDisconnected;
+    }
+    auto stored = meweb_model_auth::ReadCredential(account);
+    if (stored.status == meweb_model_auth::KeychainReadStatus::kNotFound) {
+      return CredentialLookupStatus::kDisconnected;
+    }
+    if (stored.status != meweb_model_auth::KeychainReadStatus::kSuccess ||
+        stored.credential.empty() ||
+        stored.credential.size() > kMaxMewebCredentialBytes) {
+      return CredentialLookupStatus::kKeychainError;
+    }
+    credentials.insert_or_assign(
+        key, MewebMemoryCredential{std::move(stored.credential),
+                                   base::Time::Max(), true});
+    *persisted = true;
+    return CredentialLookupStatus::kConnected;
+#else
+    return CredentialLookupStatus::kDisconnected;
+#endif
   }
 
   static bool IsSupportedAuthentication(std::string_view provider,
@@ -516,14 +604,20 @@ class MewebAgentWorkspaceHandler
                              std::string_view method,
                              bool connected,
                              std::string_view status,
-                             std::string_view message) const {
+                             std::string_view message,
+                             bool credential_persisted = false) const {
     base::DictValue result;
     result.Set("provider", provider);
     result.Set("method", method);
     result.Set("connected", connected);
     result.Set("status", status);
     result.Set("message", message);
-    result.Set("credential_persisted_by_meweb", false);
+    result.Set("credential_persisted_by_meweb", credential_persisted);
+#if BUILDFLAG(IS_MAC)
+    result.Set("keychain_available", true);
+#else
+    result.Set("keychain_available", false);
+#endif
     result.Set("broker", "chromium_native_cxx23");
     return result;
   }
@@ -546,32 +640,40 @@ class MewebAgentWorkspaceHandler
                                 "지원하지 않는 인증 방식입니다."));
       return;
     }
-    const std::string key = CredentialKey(provider, method);
-    auto& credentials = Credentials();
-    auto credential = credentials.find(key);
-    if (credential != credentials.end() &&
-        (credential->second.expires_at.is_max() ||
-         credential->second.expires_at > base::Time::Now())) {
-      Reply(args[0], AuthResult(provider, method, true, "connected",
-                                "네이티브 메모리 브로커에 연결되어 있습니다."));
+    bool persisted = false;
+    const CredentialLookupStatus lookup =
+        EnsureCredentialLoaded(provider, method, &persisted);
+    if (lookup == CredentialLookupStatus::kConnected) {
+      Reply(
+          args[0],
+          AuthResult(provider, method, true,
+                     persisted ? "connected_keychain" : "connected",
+                     persisted ? "macOS 키체인에서 자격 증명을 복원했습니다."
+                               : "네이티브 메모리 브로커에 연결되어 있습니다.",
+                     persisted));
       return;
     }
-    if (credential != credentials.end()) {
-      credentials.erase(credential);
+    if (lookup == CredentialLookupStatus::kKeychainError) {
+      Reply(args[0], AuthResult(provider, method, false, "keychain_error",
+                                "macOS 키체인 자격 증명을 읽지 못했습니다."));
+      return;
     }
     Reply(args[0], AuthResult(provider, method, false, "disconnected",
                               "현재 앱 세션에 연결된 자격 증명이 없습니다."));
   }
 
   void HandleModelAuthConnect(const base::ListValue& args) {
-    if (args.size() != 5 || !args[0].is_string() || !args[1].is_string() ||
-        !args[2].is_string() || !args[3].is_string() || !args[4].is_string()) {
+    if ((args.size() != 5 && args.size() != 6) || !args[0].is_string() ||
+        !args[1].is_string() || !args[2].is_string() || !args[3].is_string() ||
+        !args[4].is_string() || (args.size() == 6 && !args[5].is_bool())) {
       return;
     }
     const std::string& provider = args[1].GetString();
     const std::string& method = args[2].GetString();
     std::string credential = args[3].GetString();
     const GURL endpoint(args[4].GetString());
+    const bool persistence_requested = args.size() == 6 && args[5].GetBool();
+    const bool credential_was_entered = !credential.empty();
     if (!IsSupportedAuthentication(provider, method) ||
         !IsAllowedEndpoint(provider, endpoint)) {
       Reply(args[0], AuthResult(provider, method, false, "error",
@@ -584,6 +686,12 @@ class MewebAgentWorkspaceHandler
       return;
     }
     if (method == "oauth_wif") {
+      if (persistence_requested) {
+        Reply(args[0],
+              AuthResult(provider, method, false, "error",
+                         "단기 WIF 토큰은 macOS 키체인에 저장할 수 없습니다."));
+        return;
+      }
       BeginWifExchange(args[0].Clone(), provider, method);
       return;
     }
@@ -604,8 +712,17 @@ class MewebAgentWorkspaceHandler
                        "자격 증명이 없거나 허용 크기를 초과했습니다."));
       return;
     }
+    if (persistence_requested &&
+        (!CanPersistCredential(method) || !credential_was_entered)) {
+      Reply(args[0],
+            AuthResult(provider, method, false, "error",
+                       "직접 입력한 장기 자격 증명만 macOS 키체인에 저장할 수 "
+                       "있습니다."));
+      return;
+    }
     BeginCredentialValidation(args[0].Clone(), provider, method,
-                              std::move(credential), endpoint);
+                              std::move(credential), endpoint,
+                              persistence_requested);
   }
 
   void HandleModelAuthDisconnect(const base::ListValue& args) {
@@ -615,9 +732,23 @@ class MewebAgentWorkspaceHandler
     }
     const std::string& provider = args[1].GetString();
     const std::string& method = args[2].GetString();
+#if BUILDFLAG(IS_MAC)
+    if (CanPersistCredential(method)) {
+      const std::string account =
+          KeychainAccount(provider, method, /*create_namespace=*/false);
+      if (!account.empty() && !meweb_model_auth::DeleteCredential(account)) {
+        Reply(
+            args[0],
+            AuthResult(provider, method, true, "keychain_error",
+                       "macOS 키체인 자격 증명을 삭제하지 못했습니다.", true));
+        return;
+      }
+    }
+#endif
     Credentials().erase(CredentialKey(provider, method));
-    Reply(args[0], AuthResult(provider, method, false, "disconnected",
-                              "현재 앱 세션의 연결을 해제했습니다."));
+    Reply(args[0],
+          AuthResult(provider, method, false, "disconnected",
+                     "현재 앱 연결과 저장된 자격 증명을 삭제했습니다."));
   }
 
   static void AppendMessage(base::ListValue* messages,
@@ -894,6 +1025,12 @@ class MewebAgentWorkspaceHandler
          tool_choice != "none") ||
         tools_json.size() > kMaxMewebModelToolsBytes) {
       error("모델 요청 값이 허용 범위를 벗어났습니다.");
+      return;
+    }
+    bool credential_persisted = false;
+    if (EnsureCredentialLoaded(provider, method, &credential_persisted) !=
+        CredentialLookupStatus::kConnected) {
+      error("먼저 현재 모델 공급자 연결을 완료하세요.");
       return;
     }
     const std::string credential_key = CredentialKey(provider, method);
@@ -1187,9 +1324,8 @@ class MewebAgentWorkspaceHandler
   }
 
   void OnSmartEditorToolExecuted(
-      std::unique_ptr<
-          mojo::AssociatedRemote<chrome::mojom::MewebSmartEditorFrame>>
-          renderer,
+      std::unique_ptr<mojo::AssociatedRemote<
+          chrome::mojom::MewebSmartEditorFrame>> renderer,
       base::Value callback_id,
       std::string tool,
       const std::string& response_json) {
@@ -1211,23 +1347,24 @@ class MewebAgentWorkspaceHandler
       if (tool == "set_document") {
         const auto* normalized = result.FindDict("normalized_document_model");
         if (!normalized || !ValidateSmartEditorDocument(*normalized)) {
-          Reply(callback_id,
-                AgentResult(false, "roundtrip_failed",
-                            "정규화된 SmartEditor 문서가 안전 기준을 충족하지 않습니다."));
+          Reply(callback_id, AgentResult(false, "roundtrip_failed",
+                                         "정규화된 SmartEditor 문서가 안전 "
+                                         "기준을 충족하지 않습니다."));
           return;
         }
       } else if (tool == "upload_images") {
         const auto* resources = result.FindList("resources");
         if (!resources || resources->empty() || resources->size() > 10) {
           Reply(callback_id,
-                AgentResult(false, "upload_failed",
-                            "SmartEditor 이미지 리소스 결과가 올바르지 않습니다."));
+                AgentResult(
+                    false, "upload_failed",
+                    "SmartEditor 이미지 리소스 결과가 올바르지 않습니다."));
           return;
         }
         for (const auto& resource : *resources) {
-          const std::string* src =
-              resource.is_dict() ? resource.GetDict().FindString("src")
-                                 : nullptr;
+          const std::string* src = resource.is_dict()
+                                       ? resource.GetDict().FindString("src")
+                                       : nullptr;
           if (!src || !IsAllowedSmartEditorImageUrl(GURL(*src))) {
             Reply(callback_id,
                   AgentResult(false, "upload_failed",
@@ -1248,14 +1385,15 @@ class MewebAgentWorkspaceHandler
       auto result = AgentResult(
           false, "approval_required",
           tool == "upload_images"
-              ? "선택한 이미지를 네이버 SmartEditor에 업로드하려면 승인이 필요합니다."
+              ? "선택한 이미지를 네이버 SmartEditor에 업로드하려면 승인이 "
+                "필요합니다."
               : "SmartEditor 초안 문서 모델을 변경하려면 승인이 필요합니다.");
-      result.Set("risk", tool == "upload_images" ? "image_upload"
-                                                   : "draft_mutation");
+      result.Set("risk",
+                 tool == "upload_images" ? "image_upload" : "draft_mutation");
       if (tool == "upload_images") {
         const auto* images = arguments.FindList("images");
-        result.Set("summary",
-                   base::StringPrintf("이미지 %zu개", images ? images->size() : 0));
+        result.Set("summary", base::StringPrintf("이미지 %zu개",
+                                                 images ? images->size() : 0));
       } else {
         result.Set("summary", "제목·본문·이미지 초안 반영");
       }
@@ -1264,16 +1402,19 @@ class MewebAgentWorkspaceHandler
     }
     if (tool == "upload_images" && !ValidateSmartEditorImages(arguments)) {
       Reply(callback_id,
-            AgentResult(false, "invalid_arguments",
-                        "이미지 형식, 이름 또는 크기가 허용 범위를 벗어났습니다."));
+            AgentResult(
+                false, "invalid_arguments",
+                "이미지 형식, 이름 또는 크기가 허용 범위를 벗어났습니다."));
       return;
     }
     if (tool == "set_document") {
       const auto* model = arguments.FindDict("document_model");
       if (!model || !ValidateSmartEditorDocument(*model)) {
-        Reply(callback_id,
-              AgentResult(false, "invalid_document",
-                          "SmartEditor 문서 모델 구조가 안전 기준을 충족하지 않습니다."));
+        Reply(
+            callback_id,
+            AgentResult(
+                false, "invalid_document",
+                "SmartEditor 문서 모델 구조가 안전 기준을 충족하지 않습니다."));
         return;
       }
     }
@@ -1282,9 +1423,10 @@ class MewebAgentWorkspaceHandler
     const int frame_index = arguments.FindInt("frame_index").value_or(-1);
     if (frame_index < 0 || frame_index >= static_cast<int>(frames.size()) ||
         !frames[frame_index] || !frames[frame_index]->IsRenderFrameLive()) {
-      Reply(callback_id,
-            AgentResult(false, "stale_observation",
-                        "SmartEditor 프레임이 변경되었습니다. 다시 관찰하세요."));
+      Reply(
+          callback_id,
+          AgentResult(false, "stale_observation",
+                      "SmartEditor 프레임이 변경되었습니다. 다시 관찰하세요."));
       return;
     }
     if (!IsAllowedSmartEditorFrameUrl(
@@ -1299,9 +1441,8 @@ class MewebAgentWorkspaceHandler
     request.Set("arguments", arguments.Clone());
     std::string request_json;
     if (!base::JSONWriter::Write(request, &request_json)) {
-      Reply(callback_id,
-            AgentResult(false, "invalid_arguments",
-                        "SmartEditor 요청을 만들 수 없습니다."));
+      Reply(callback_id, AgentResult(false, "invalid_arguments",
+                                     "SmartEditor 요청을 만들 수 없습니다."));
       return;
     }
     auto renderer = std::make_unique<
@@ -1471,8 +1612,7 @@ class MewebAgentWorkspaceHandler
       return;
     }
     const std::string& tool = args[1].GetString();
-    if (args[2].GetString().size() >
-        kMaxMewebSmartEditorTotalImageBytes * 2) {
+    if (args[2].GetString().size() > kMaxMewebSmartEditorTotalImageBytes * 2) {
       Reply(args[0], AgentResult(false, "invalid_arguments",
                                  "도구 요청 크기가 허용 범위를 벗어났습니다."));
       return;
@@ -1648,7 +1788,8 @@ class MewebAgentWorkspaceHandler
                                  std::string provider,
                                  std::string method,
                                  std::string credential,
-                                 const GURL& endpoint) {
+                                 const GURL& endpoint,
+                                 bool persistence_requested) {
     auto request = std::make_unique<network::ResourceRequest>();
     request->url = ValidationUrl(provider, endpoint);
     request->method = "GET";
@@ -1671,13 +1812,14 @@ class MewebAgentWorkspaceHandler
         base::BindOnce(&MewebAgentWorkspaceHandler::OnCredentialValidated,
                        weak_ptr_factory_.GetWeakPtr(), std::move(callback_id),
                        std::move(provider), std::move(method),
-                       std::move(credential)));
+                       std::move(credential), persistence_requested));
   }
 
   void OnCredentialValidated(base::Value callback_id,
                              std::string provider,
                              std::string method,
                              std::string credential,
+                             bool persistence_requested,
                              bool success,
                              std::optional<std::string> body) {
     if (!success) {
@@ -1686,14 +1828,46 @@ class MewebAgentWorkspaceHandler
                                     "자격 증명을 확인하세요."));
       return;
     }
+    bool persisted = false;
+#if BUILDFLAG(IS_MAC)
+    if (CanPersistCredential(method)) {
+      const std::string account = KeychainAccount(
+          provider, method, /*create_namespace=*/persistence_requested);
+      if (persistence_requested) {
+        persisted = !account.empty() &&
+                    meweb_model_auth::SaveCredential(account, credential);
+      } else if (!account.empty() &&
+                 !meweb_model_auth::DeleteCredential(account)) {
+        Reply(callback_id,
+              AuthResult(provider, method, false, "keychain_error",
+                         "기존 macOS 키체인 자격 증명을 삭제하지 못했습니다.",
+                         true));
+        return;
+      }
+    }
+#endif
     Credentials().insert_or_assign(
         CredentialKey(provider, method),
-        MewebMemoryCredential{std::move(credential), base::Time::Max()});
+        MewebMemoryCredential{std::move(credential), base::Time::Max(),
+                              persisted});
+    if (persistence_requested && !persisted) {
+      Reply(
+          callback_id,
+          AuthResult(provider, method, true, "connected_memory_only",
+                     "공급자 연결은 완료했지만 macOS 키체인 저장에 실패해 현재 "
+                     "앱 메모리에서만 사용합니다."));
+      return;
+    }
     Reply(callback_id,
-          AuthResult(provider, method, true, "connected",
-                     provider == "ollama"
+          AuthResult(provider, method, true,
+                     persisted ? "connected_keychain" : "connected",
+                     persisted
+                         ? "공급자 연결을 확인하고 자격 증명을 macOS 키체인에 "
+                           "저장했습니다."
+                     : provider == "ollama"
                          ? "Ollama API 연결과 버전 응답을 확인했습니다."
-                         : "공급자 API 연결과 자격 증명을 확인했습니다."));
+                         : "공급자 API 연결과 자격 증명을 확인했습니다.",
+                     persisted));
   }
 
   bool ReadIdentityToken(const std::string& path_value,
@@ -1836,7 +2010,8 @@ class MewebAgentWorkspaceHandler
     Credentials().insert_or_assign(
         CredentialKey(provider, method),
         MewebMemoryCredential{*access_token,
-                              base::Time::Now() + base::Seconds(*expires_in)});
+                              base::Time::Now() + base::Seconds(*expires_in),
+                              false});
     auto result = AuthResult(provider, method, true, "connected",
                              "단기 WIF 토큰을 메모리에 연결했습니다.");
     result.Set("expires_in", *expires_in);
@@ -3690,6 +3865,8 @@ bool NewTabPageUI::IsNewTabPageOrigin(const GURL& url) {
 void NewTabPageUI::RegisterProfilePrefs(PrefRegistrySimple* registry) {
   registry->RegisterTimePref(kPrevNavigationTimePrefName, base::Time());
   registry->RegisterStringPref(kMewebAgentWorkspaceStatePref, std::string());
+  registry->RegisterStringPref(kMewebModelAuthKeychainNamespacePref,
+                               std::string());
   registry->RegisterBooleanPref(ntp_prefs::kNtpCustomLinksVisible, true);
   registry->RegisterBooleanPref(ntp_prefs::kNtpEnterpriseShortcutsVisible,
                                 false);
