@@ -14,6 +14,7 @@
 #include "base/metrics/histogram_functions.h"
 #include "base/metrics/user_metrics.h"
 #include "base/metrics/user_metrics_action.h"
+#include "base/strings/utf_string_conversions.h"
 #include "base/time/time.h"
 #include "chrome/browser/ui/actions/chrome_action_id.h"
 #include "chrome/browser/ui/animation/browser_animation_controller.h"
@@ -52,15 +53,20 @@
 #include "chrome/grit/generated_resources.h"
 #include "components/tabs/public/tab_group.h"
 #include "components/tabs/public/tab_interface.h"
+#include "components/vector_icons/vector_icons.h"
+#include "components/version_info/version_info.h"
 #include "ui/base/dragdrop/os_exchange_data.h"
 #include "ui/base/interaction/element_tracker.h"
 #include "ui/base/l10n/l10n_util.h"
 #include "ui/base/metadata/metadata_impl_macros.h"
+#include "ui/base/models/image_model.h"
+#include "ui/base/window_open_disposition.h"
 #include "ui/compositor/layer.h"
 #include "ui/display/screen.h"
 #include "ui/events/event.h"
 #include "ui/gfx/geometry/point.h"
 #include "ui/views/background.h"
+#include "ui/views/border.h"
 #include "ui/views/controls/button/label_button.h"
 #include "ui/views/controls/focus_ring.h"
 #include "ui/views/controls/resize_area.h"
@@ -79,6 +85,13 @@ constexpr int kResizeAreaWidth = 5;
 constexpr int kCollapsedResizeAreaWidth = 2;
 constexpr int kKeyboardResizeWidth = 50;
 constexpr int kSnapDistance = 15;
+constexpr int kMewebSettingsIconSize = 16;
+
+std::u16string MewebSettingsLabel() {
+  std::u16string label = u"MEWEB · ";
+  label.append(base::UTF8ToUTF16(version_info::GetVersionNumber()));
+  return label;
+}
 
 // Shadow is used in expand-on-hover mode. Shadow radius and opacity are dynamic
 // and set by the layout.
@@ -153,6 +166,34 @@ VerticalTabStripRegionView::VerticalTabStripRegionView(
           GetLayoutConstant(
               LayoutConstant::kVerticalTabStripCollapsedVerticalPadding),
           region_horizontal_padding, 0, region_horizontal_padding));
+
+  meweb_footer_separator_ = AddChildView(std::make_unique<views::Separator>());
+  meweb_footer_separator_->SetProperty(
+      views::kMarginsKey, gfx::Insets::VH(0, region_horizontal_padding));
+
+  auto meweb_settings_button = std::make_unique<views::LabelButton>(
+      base::BindRepeating(
+          [](BrowserWindowInterface* browser) {
+            browser->OpenGURL(GURL("chrome://new-tab-page/?meweb=settings"),
+                              WindowOpenDisposition::NEW_FOREGROUND_TAB);
+          },
+          browser_view->browser()),
+      MewebSettingsLabel());
+  meweb_settings_button->SetImageModel(
+      views::Button::STATE_NORMAL,
+      ui::ImageModel::FromVectorIcon(vector_icons::kSettingsIcon,
+                                     kColorTabForegroundInactiveFrameActive,
+                                     kMewebSettingsIconSize));
+  meweb_settings_button->SetImageLabelSpacing(7);
+  meweb_settings_button->SetHorizontalAlignment(gfx::ALIGN_LEFT);
+  meweb_settings_button->SetBorder(
+      views::CreateEmptyBorder(gfx::Insets::VH(6, 8)));
+  meweb_settings_button->SetTooltipText(u"MEWEB 환경설정 열기");
+  meweb_settings_button->GetViewAccessibility().SetName(u"MEWEB 환경설정");
+  meweb_settings_button->SetProperty(
+      views::kMarginsKey, gfx::Insets::TLBR(6, region_horizontal_padding, 0,
+                                            region_horizontal_padding));
+  meweb_settings_button_ = AddChildView(std::move(meweb_settings_button));
 
   gemini_button_ = AddChildView(std::make_unique<views::View>());
 
@@ -766,6 +807,12 @@ void VerticalTabStripRegionView::OnCollapseStateChanged(
   // the collapsing state.
   bool collapsed = state != tabs::VerticalTabStripCollapseState::kExpanded;
 
+  meweb_settings_button_->SetText(collapsed ? std::u16string()
+                                            : MewebSettingsLabel());
+  meweb_settings_button_->SetImageLabelSpacing(collapsed ? 0 : 7);
+  meweb_settings_button_->SetHorizontalAlignment(collapsed ? gfx::ALIGN_CENTER
+                                                           : gfx::ALIGN_LEFT);
+
   resize_area_->SetVisible(!collapsed ||
                            !state_controller_->IsExpandOnHoverEnabled() ||
                            resize_area_->is_resizing());
@@ -806,6 +853,9 @@ void VerticalTabStripRegionView::UpdateColors() {
   top_button_separator_->SetColorId(IsFrameActive()
                                         ? kColorTabDividerFrameActive
                                         : kColorTabDividerFrameInactive);
+  meweb_footer_separator_->SetColorId(IsFrameActive()
+                                          ? kColorTabDividerFrameActive
+                                          : kColorTabDividerFrameInactive);
 }
 
 bool VerticalTabStripRegionView::IsFrameActive() const {

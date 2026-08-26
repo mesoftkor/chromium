@@ -41,6 +41,7 @@ class VerticalTabStripStateController;
 }  // namespace tabs
 
 namespace views {
+class LabelButton;
 class ResizeArea;
 class Separator;
 class View;
@@ -85,6 +86,10 @@ class VerticalTabStripRegionView final
 
   VerticalTabStripBottomContainer* GetBottomContainer() {
     return bottom_button_container_;
+  }
+
+  views::LabelButton* meweb_settings_button_for_testing() {
+    return meweb_settings_button_;
   }
 
   bool IsPositionInWindowCaption(const gfx::Point& point) override;
@@ -238,6 +243,8 @@ class VerticalTabStripRegionView final
   raw_ptr<VerticalTabStripTopContainer> top_button_container_ = nullptr;
   raw_ptr<views::Separator> top_button_separator_ = nullptr;
   raw_ptr<VerticalTabStripBottomContainer> bottom_button_container_ = nullptr;
+  raw_ptr<views::Separator> meweb_footer_separator_ = nullptr;
+  raw_ptr<views::LabelButton> meweb_settings_button_ = nullptr;
   raw_ptr<views::View> gemini_button_ = nullptr;
   raw_ptr<views::ResizeArea> resize_area_ = nullptr;
   raw_ptr<ShadowFrameView> shadow_frame_ = nullptr;

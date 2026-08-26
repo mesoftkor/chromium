@@ -76,7 +76,10 @@ class VerticalTabsBrowserTestMixin : public T {
   }
 
   void EnterVerticalTabsMode() {
-    vertical_tab_strip_state_controller()->SetVerticalTabsEnabled(true);
+    auto* controller = vertical_tab_strip_state_controller();
+    if (!controller->ShouldDisplayVerticalTabs()) {
+      controller->SetVerticalTabsEnabled(true);
+    }
     T::RunScheduledLayouts();
   }
 

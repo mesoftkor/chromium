@@ -344,6 +344,17 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       isSecretFieldName(key) || containsSecretField(child));
   }
 
+  function sanitizeAccountLabels(candidate) {
+    const labels = candidate && typeof candidate === 'object' &&
+            candidate.labels && typeof candidate.labels === 'object' ?
+        candidate.labels : {};
+    return {
+      labels: Object.fromEntries(Object.keys(SITE_ACCOUNT_DEFINITIONS).map(
+          account => [account, typeof labels[account] === 'string' ?
+            labels[account].trim().slice(0, 120) : ''])),
+    };
+  }
+
   function modelDefaults(profileId = 'openai/gpt-4o-mini') {
     const migrated = LEGACY_MODEL_PROFILE_IDS[profileId] || profileId;
     const selected = MODEL_PROFILES[migrated] ? migrated : MODEL_PROFILE_IDS[0];
@@ -522,6 +533,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       persona: {avatar: 'ribbon', name: '미웹', domain: 'finance', tone: 'standard', autonomy: 'risky', showReason: true},
       workflow: {custom: [], pinned: ['이월 항목 대사', '월마감 체크리스트'], removed: [], shortcuts: true},
       adaptive: {enabled: true, basis: 'time', hour: 0, forgotten: []},
+      accounts: sanitizeAccountLabels(),
       model: modelDefaults(),
       start: {engine: 'google', showLinks: true, showTasks: true, links: [
         {name: '정산 문서', url: 'https://docs.mesoft.kr', color: '#7ee0c0'},
@@ -546,6 +558,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       for (const key of Object.keys(base)) {
         if (parsed[key] && typeof parsed[key] === 'object') Object.assign(base[key], parsed[key]);
       }
+      base.accounts = sanitizeAccountLabels(parsed.accounts);
       base.model = sanitizeModelSettings(parsed.model);
       if (!Array.isArray(base.task.audit)) base.task.audit = [];
       if (!base.task.decisions || typeof base.task.decisions !== 'object') base.task.decisions = {};
@@ -579,7 +592,10 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
   };
   let modelStreamEvents = [];
   let modelTestPrompt = 'MEWEB 모델 연결 시험입니다. 한 문장으로 응답하세요.';
-  let currentView = 'start';
+  let currentView = new URLSearchParams(window.location.search)
+                        .get('meweb') === 'settings' ||
+          window.location.hash === '#settings' ?
+      'settings' : 'start';
   let settingsSection = 'agent';
   let engineMenuOpen = false;
   let auditOpen = false;
@@ -791,7 +807,10 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
                 status.status === 'checking' ? '확인 중' : '연결 안 됨';
             const statusClass = status.connected ? 'run' :
                 status.status === 'checking' ? 'gate' : 'done';
-            return `<div class="account-card" data-site-account="${account}" data-status="${esc(status.status)}"><div class="account-head"><span class="account-icon">${esc(definition.icon)}</span><span class="account-name"><b>${esc(definition.label)}</b><small>${esc(definition.domain)} · Chromium 프로필 세션</small></span><span class="chip ${statusClass}">${statusLabel}</span></div><p class="account-message">${esc(status.message)}</p><div class="account-actions"><button class="btn primary" data-open-site-account="${account}">${status.connected ? '다른 계정으로 로그인' : '공식 로그인 열기'}</button><button class="btn" data-check-site-account="${account}">상태 확인</button><button class="btn danger" data-disconnect-site-account="${account}" ${status.connected ? '' : 'disabled'}>세션 연결 해제</button></div></div>`;
+            const identity = state.accounts.labels[account] || '';
+            const identityLabel = status.connected && identity ? identity :
+                status.connected ? '확인 후 아래에 입력하세요.' : '연결된 계정 없음';
+            return `<div class="account-card" data-site-account="${account}" data-status="${esc(status.status)}"><div class="account-head"><span class="account-icon">${esc(definition.icon)}</span><span class="account-name"><b>${esc(definition.label)}</b><small>${esc(definition.domain)} · Chromium 프로필 세션</small></span><span class="chip ${statusClass}">${statusLabel}</span></div><p class="account-message">${esc(status.message)}</p><div class="account-identity"><span>로그인 ID/이메일</span><b>${esc(identityLabel)}</b></div><div class="account-label-row"><input class="text-input" data-site-account-label="${account}" value="${esc(identity)}" maxlength="120" placeholder="현재 로그인한 ID 또는 이메일" ${status.connected ? '' : 'disabled'}><button class="btn" data-save-site-account-label="${account}" ${status.connected ? '' : 'disabled'}>표시 저장</button></div><div class="account-actions"><button class="btn primary" data-open-site-account="${account}">${status.connected ? '다른 계정으로 로그인' : '공식 로그인 열기'}</button><button class="btn" data-check-site-account="${account}">상태 확인</button><button class="btn danger" data-disconnect-site-account="${account}" ${status.connected ? '' : 'disabled'}>세션 연결 해제</button></div></div>`;
           }).join('');
       const modelCards = MODEL_ACCOUNT_DEFINITIONS.map(definition => {
         const status = modelAccountConnections[definition.provider];
@@ -805,7 +824,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
         return `<div class="account-card" data-model-account="${esc(definition.provider)}" data-status="${esc(status.status)}"><div class="account-head"><span class="account-icon">${esc(definition.label.slice(0, 1))}</span><span class="account-name"><b>${esc(definition.label)}</b><small>${esc(storage)}${status.methodLabel ? ` · ${esc(status.methodLabel)}` : ''}</small></span><span class="chip ${statusClass}">${statusLabel}</span></div><p class="account-message">${esc(status.message)}</p><div class="account-actions"><button class="btn primary" data-open-model-account="${esc(definition.provider)}">모델 설정</button><button class="btn danger" data-disconnect-model-account="${esc(definition.provider)}" ${status.connected ? '' : 'disabled'}>모든 모델 연결 해제</button></div></div>`;
       }).join('');
       setHtml(content, `<h1>계정·연결</h1><p class="lede">웹 로그인과 AI 모델 연결을 한 화면에서 확인하고 해제합니다.</p>
-        <section class="settings-card"><h2>웹 로그인</h2><div class="setting-row"><div class="note"><b>비밀번호와 쿠키 값은 이 화면이나 Agent에 전달하지 않습니다.</b><br>로그인은 공식 사이트에서 사용자가 직접 완료하며, 상태는 현재 Chromium 프로필의 인증 쿠키 존재 여부만 확인합니다.</div></div><div class="setting-row"><div class="account-grid">${siteCards}</div></div></section>
+        <section class="settings-card"><h2>웹 로그인</h2><div class="setting-row"><div class="note"><b>비밀번호와 쿠키 값은 이 화면이나 Agent에 전달하지 않습니다.</b><br>로그인은 공식 사이트에서 사용자가 직접 완료합니다. 일반 웹 세션은 공식 OAuth 프로필 권한이 없으므로, 로그인 ID/이메일은 사용자가 확인한 표시값만 Chromium 프로필에 저장합니다.</div></div><div class="setting-row"><div class="account-grid">${siteCards}</div></div></section>
         <section class="settings-card"><h2>AI 모델 공급자</h2><div class="setting-row"><div class="note">기본값은 앱 메모리 전용입니다. 사용자가 저장을 선택한 장기 자격 증명만 macOS 키체인에서 복원합니다.</div></div><div class="setting-row"><div class="account-grid">${modelCards}</div></div></section>
         <div class="setting-row"><div class="setting-control"><button class="btn primary" id="refreshAccountConnectionsButton" ${accountConnectionsRefreshing ? 'disabled' : ''}>전체 상태 새로고침</button></div><div class="validation" id="accountConnectionsStatus">${accountConnectionsRefreshing ? '계정 연결 상태를 확인하고 있습니다.' : '계정 비밀값은 Preferences와 localStorage에 저장하지 않습니다.'}</div></div>`);
     } else if (settingsSection === 'models') {
@@ -1262,6 +1281,36 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     }
   }
 
+  function saveSiteAccountLabel(account, labelOverride) {
+    if (!SITE_ACCOUNT_DEFINITIONS[account] ||
+        !siteAccountConnections[account]?.connected) {
+      return false;
+    }
+    const input = document.querySelector(
+        `[data-site-account-label="${account}"]`);
+    const label = String(labelOverride ?? input?.value ?? '')
+        .trim().slice(0, 120);
+    if (!label) {
+      toast('현재 로그인한 ID 또는 이메일을 입력하세요.');
+      return false;
+    }
+    state.accounts.labels[account] = label;
+    save();
+    if (settingsSection === 'accounts') renderSettings();
+    toast(`${SITE_ACCOUNT_DEFINITIONS[account].label} 계정 표시를 저장했습니다.`);
+    return true;
+  }
+
+  function clearSiteAccountLabel(account) {
+    if (!SITE_ACCOUNT_DEFINITIONS[account] ||
+        !state.accounts.labels[account]) {
+      return false;
+    }
+    state.accounts.labels[account] = '';
+    save();
+    return true;
+  }
+
   async function checkSiteAccount(account, shouldRender = true) {
     if (!SITE_ACCOUNT_DEFINITIONS[account]) return null;
     siteAccountConnections[account] = {
@@ -1278,6 +1327,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
         connected: result?.connected === true,
         message: result?.message || '로그인 상태 결과가 없습니다.',
       };
+      if (result?.status === 'disconnected') clearSiteAccountLabel(account);
       if (shouldRender && settingsSection === 'accounts') renderSettings();
       return result;
     } catch (_error) {
@@ -1356,6 +1406,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
   function openSiteAccountLogin(account) {
     const definition = SITE_ACCOUNT_DEFINITIONS[account];
     if (!definition) return false;
+    clearSiteAccountLabel(account);
     const opened = openUrl(definition.loginUrl);
     if (opened) {
       record(`${definition.label} 공식 로그인 화면을 열었습니다.`);
@@ -1380,6 +1431,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       connected: result?.connected === true,
       message: result?.message || '세션 연결 해제 결과가 없습니다.',
     };
+    if (result?.connected !== true) clearSiteAccountLabel(account);
     record(`${definition.label} 웹 로그인 세션 연결을 해제했습니다.`);
     if (settingsSection === 'accounts') renderSettings();
     toast(`${definition.label} 웹 로그인 세션을 연결 해제했습니다.`);
@@ -1887,6 +1939,9 @@ SmartEditor ONE 프레임을 발견하면 일반 DOM 입력 대신 inspect_edito
     if (button.dataset.openSiteAccount) {
       openSiteAccountLogin(button.dataset.openSiteAccount); return;
     }
+    if (button.dataset.saveSiteAccountLabel) {
+      saveSiteAccountLabel(button.dataset.saveSiteAccountLabel); return;
+    }
     if (button.dataset.checkSiteAccount) {
       checkSiteAccount(button.dataset.checkSiteAccount); return;
     }
@@ -2007,6 +2062,11 @@ SmartEditor ONE 프레임을 발견하면 일반 DOM 입력 대신 inspect_edito
     if (event.target.id === 'searchInput' && event.key === 'Enter') { event.preventDefault(); runSearch(); return; }
     if ((event.target.id === 'linkNameInput' || event.target.id === 'linkUrlInput') && event.key === 'Enter') { event.preventDefault(); addLink(); return; }
     if (event.target.id === 'workflowInput' && event.key === 'Enter') { event.preventDefault(); addWorkflow(); return; }
+    if (event.target.dataset.siteAccountLabel && event.key === 'Enter') {
+      event.preventDefault();
+      saveSiteAccountLabel(event.target.dataset.siteAccountLabel);
+      return;
+    }
     if ((event.target.id === 'modelEndpointInput' || event.target.id === 'modelOutputTokensInput') && event.key === 'Enter') { event.preventDefault(); applyModelSettings(); return; }
     if (event.key === 'Escape') {
       if (engineMenuOpen) { engineMenuOpen = false; renderStart(); }
@@ -2043,6 +2103,8 @@ SmartEditor ONE 프레임을 발견하면 일반 DOM 입력 대신 inspect_edito
       sites: SITE_ACCOUNT_DEFINITIONS,
       models: MODEL_ACCOUNT_DEFINITIONS,
     })),
+    setSiteAccountLabel: (account, label) =>
+      saveSiteAccountLabel(account, label),
     refreshAccountConnections: () => refreshAccountConnections(),
     checkSiteAccount: account => checkSiteAccount(account),
     disconnectSiteAccount: account => disconnectSiteAccount(account),
@@ -2132,6 +2194,7 @@ SmartEditor ONE 프레임을 발견하면 일반 DOM 입력 대신 inspect_edito
         }
       }
       restored.model = sanitizeModelSettings(parsed.model);
+      restored.accounts = sanitizeAccountLabels(parsed.accounts);
       if (!Array.isArray(restored.task.audit)) restored.task.audit = [];
       if (!restored.task.decisions ||
           typeof restored.task.decisions !== 'object') {

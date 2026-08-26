@@ -1128,6 +1128,29 @@ IN_PROC_BROWSER_TEST_F(VerticalTabStripRegionViewTest,
 }
 
 IN_PROC_BROWSER_TEST_F(VerticalTabStripRegionViewTest,
+                       MewebSettingsFooterOpensWorkspaceSettings) {
+  views::LabelButton* settings_button =
+      region_view()->meweb_settings_button_for_testing();
+  ASSERT_TRUE(settings_button);
+  EXPECT_NE(std::u16string::npos, settings_button->GetText().find(u"MEWEB"));
+  EXPECT_FALSE(settings_button->GetImage(views::Button::STATE_NORMAL).isNull());
+
+  settings_button->button_controller()->NotifyClick();
+  ASSERT_TRUE(base::test::RunUntil([&]() {
+    return browser()
+               ->tab_strip_model()
+               ->GetActiveWebContents()
+               ->GetVisibleURL() ==
+           GURL("chrome://new-tab-page/?meweb=settings");
+  }));
+
+  state_controller()->RequestCollapse(true);
+  ASSERT_TRUE(base::test::RunUntil(
+      [&]() { return state_controller()->IsCollapsed(); }));
+  EXPECT_TRUE(settings_button->GetText().empty());
+}
+
+IN_PROC_BROWSER_TEST_F(VerticalTabStripRegionViewTest,
                        ExpandOnHoverLockBehavior) {
   // Set up collapsed vertical tab strip with expand on hover enabled.
   VerticalTabStripRegionView* view = region_view();
