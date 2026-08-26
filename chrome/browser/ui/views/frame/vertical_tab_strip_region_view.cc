@@ -86,6 +86,7 @@ constexpr int kCollapsedResizeAreaWidth = 2;
 constexpr int kKeyboardResizeWidth = 50;
 constexpr int kSnapDistance = 15;
 constexpr int kMewebSettingsIconSize = 16;
+constexpr int kMewebSettingsCornerRadius = 8;
 
 std::u16string MewebSettingsLabel() {
   std::u16string label = u"MEWEB · ";
@@ -185,9 +186,14 @@ VerticalTabStripRegionView::VerticalTabStripRegionView(
                                      kColorTabForegroundInactiveFrameActive,
                                      kMewebSettingsIconSize));
   meweb_settings_button->SetImageLabelSpacing(7);
-  meweb_settings_button->SetHorizontalAlignment(gfx::ALIGN_LEFT);
-  meweb_settings_button->SetBorder(
-      views::CreateEmptyBorder(gfx::Insets::VH(6, 8)));
+  meweb_settings_button->SetHorizontalAlignment(gfx::ALIGN_RIGHT);
+  meweb_settings_button->SetFocusRingCornerRadius(
+      kMewebSettingsCornerRadius);
+  meweb_settings_button->SetBorder(views::CreatePaddedBorder(
+      views::CreateRoundedRectBorder(
+          1, kMewebSettingsCornerRadius,
+          kColorTabForegroundInactiveFrameActive),
+      gfx::Insets::VH(5, 7)));
   meweb_settings_button->SetTooltipText(u"MEWEB 환경설정 열기");
   meweb_settings_button->GetViewAccessibility().SetName(u"MEWEB 환경설정");
   meweb_settings_button->SetProperty(
@@ -811,7 +817,7 @@ void VerticalTabStripRegionView::OnCollapseStateChanged(
                                             : MewebSettingsLabel());
   meweb_settings_button_->SetImageLabelSpacing(collapsed ? 0 : 7);
   meweb_settings_button_->SetHorizontalAlignment(collapsed ? gfx::ALIGN_CENTER
-                                                           : gfx::ALIGN_LEFT);
+                                                           : gfx::ALIGN_RIGHT);
 
   resize_area_->SetVisible(!collapsed ||
                            !state_controller_->IsExpandOnHoverEnabled() ||

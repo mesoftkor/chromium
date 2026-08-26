@@ -1134,6 +1134,9 @@ IN_PROC_BROWSER_TEST_F(VerticalTabStripRegionViewTest,
   ASSERT_TRUE(settings_button);
   EXPECT_NE(std::u16string::npos, settings_button->GetText().find(u"MEWEB"));
   EXPECT_FALSE(settings_button->GetImage(views::Button::STATE_NORMAL).isNull());
+  EXPECT_EQ(gfx::ALIGN_RIGHT, settings_button->GetHorizontalAlignment());
+  ASSERT_TRUE(settings_button->GetBorder());
+  EXPECT_GT(settings_button->GetInsets().left(), 1);
 
   settings_button->button_controller()->NotifyClick();
   ASSERT_TRUE(base::test::RunUntil([&]() {
