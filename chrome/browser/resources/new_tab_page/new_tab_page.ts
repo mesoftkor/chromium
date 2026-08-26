@@ -1275,6 +1275,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
         frame_index: frame.frame_index,
         url: frame.url,
         title: frame.title,
+        login_form_detected: Boolean(frame.login_form_detected),
         text: String(frame.text || '').slice(0, 9000),
         elements: frame.elements || [],
       })),
@@ -1373,6 +1374,12 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
         agentRuntime.message = iteration ? '도구 실행 결과 재검증 중' : '현재 탭 관찰 중';
         renderAgentPanel();
         const observation = await observeAgentTarget();
+        if ((observation.frames || []).some(frame => frame.login_form_detected)) {
+          const message = '로그인 화면을 감지했습니다. 계정과 비밀번호 입력은 사용자가 직접 완료한 뒤 다시 실행해 주세요.';
+          completeAgent('USER_ACTION_REQUIRED', message, 'system');
+          record('AI Agent가 로그인 화면을 감지하고 사용자 직접 조치를 요청했습니다.');
+          return true;
+        }
         setAgentPlan(1);
         agentRuntime.message = `${iteration + 1}번째 동작 계획 중`;
         renderAgentPanel();
@@ -1422,6 +1429,11 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
         const auditSummary = result?.summary ? ` · ${result.summary}` : '';
         record(`AI Agent 도구 실행: ${call.name} · ${result?.status || 'unknown'}${auditSummary}`);
         if (!result?.ok) {
+          if (result?.status === 'login_required') {
+            completeAgent('USER_ACTION_REQUIRED', result.message, 'system');
+            record('AI Agent가 로그인 자격 증명 또는 제출 동작 전에 중단했습니다.');
+            return true;
+          }
           if (result?.status === 'publish_blocked') {
             throw new Error(result.message);
           }

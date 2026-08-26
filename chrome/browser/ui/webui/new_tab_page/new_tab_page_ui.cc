@@ -1017,6 +1017,18 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
         const nodes = Array.from(document.querySelectorAll(
             'a[href],button,input:not([type="hidden"]),textarea,select,' +
             '[contenteditable="true"],[role="button"],[tabindex]')).slice(0, 100);
+        const visible = node => {
+          const style = getComputedStyle(node);
+          return !node.hidden && style.display !== 'none' &&
+              style.visibility !== 'hidden' && node.getClientRects().length > 0;
+        };
+        const loginFormDetected = nodes.some(node => {
+          if (!visible(node)) return false;
+          const type = clean(node.getAttribute('type')).toLowerCase();
+          const autocomplete = clean(node.getAttribute('autocomplete')).toLowerCase();
+          return type === 'password' ||
+              /(^|\s)(current-password|new-password|one-time-code)(\s|$)/.test(autocomplete);
+        });
         const elements = nodes.map(node => {
           let ref = node.getAttribute('data-meweb-agent-ref');
           if (!ref) {
@@ -1024,13 +1036,18 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
             node.setAttribute('data-meweb-agent-ref', ref);
           }
           const type = clean(node.getAttribute('type')).toLowerCase();
-          const sensitive = ['password', 'email', 'tel'].includes(type);
+          const autocomplete = clean(node.getAttribute('autocomplete')).toLowerCase();
+          const name = clean(node.getAttribute('name'));
+          const sensitive = ['password', 'email', 'tel'].includes(type) ||
+              /(^|\s)(username|current-password|new-password|one-time-code)(\s|$)/.test(autocomplete) ||
+              /^(user(name)?|login|email|phone|tel|password|passwd)$/i.test(name);
           return {
             ref,
             tag: node.tagName.toLowerCase(),
             role: clean(node.getAttribute('role')),
             type,
-            name: clean(node.getAttribute('name')),
+            name,
+            autocomplete,
             label: clean(node.getAttribute('aria-label') ||
                          node.getAttribute('title') || node.innerText ||
                          node.getAttribute('placeholder')).slice(0, 240),
@@ -1048,6 +1065,7 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
           url: location.href,
           title: document.title,
           text: bodyText,
+          login_form_detected: loginFormDetected,
           elements
         };
       })()
@@ -1200,8 +1218,17 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
         if (!node || !node.isConnected) {
           return {ok: false, status: 'stale_observation', message: '대상 요소가 변경되었습니다. 다시 관찰하세요.'};
         }
+        const label = clean(node.getAttribute('aria-label') || node.title || node.innerText ||
+                            node.getAttribute('placeholder') || node.value);
+        const inputType = clean(node.getAttribute('type')).toLowerCase();
+        const autocomplete = clean(node.getAttribute('autocomplete')).toLowerCase();
         if (')JS",
                                              tool, R"JS(' === 'type') {
+          if (inputType === 'password' ||
+              /(^|\s)(current-password|new-password|one-time-code)(\s|$)/.test(autocomplete) ||
+              /(비밀번호|패스워드|password|passcode|otp|인증번호)/i.test(label)) {
+            return {ok: false, status: 'login_required', message: '로그인 자격 증명과 인증번호는 사용자가 직접 입력해야 합니다.', summary: label};
+          }
           const text = String(args.text || '').slice(0, 20000);
           node.focus();
           if (node.isContentEditable) {
@@ -1219,7 +1246,12 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
           }
           return {ok: true, status: 'executed', message: '요청한 문자를 입력했습니다.', ref};
         }
-        const label = clean(node.getAttribute('aria-label') || node.title || node.innerText || node.value);
+        const loginForm = node.form || node.closest?.('form');
+        const submitsLoginForm = Boolean(loginForm?.querySelector(
+            'input[type="password"],input[autocomplete="current-password"],input[autocomplete="new-password"]'));
+        if (/(로그인|sign\s*in|log\s*in)/i.test(label) || submitsLoginForm) {
+          return {ok: false, status: 'login_required', message: '로그인은 사용자가 직접 완료해야 합니다.', summary: label};
+        }
         if (/(발행|게시|publish|예약\s*발행|임시\s*저장)/i.test(label)) {
           return {ok: false, status: 'publish_blocked', message: '발행·게시·임시저장 동작은 에이전트가 실행할 수 없습니다.', summary: label};
         }
