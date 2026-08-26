@@ -1,0 +1,12 @@
+// Copyright 2026 The MEWEB Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+module chrome.mojom;
+
+// Executes one bounded SmartEditor operation in the frame's main JavaScript
+// world. The browser validates the tool and arguments before invoking this
+// renderer bridge. The renderer validates the frame origin again.
+interface MewebSmartEditorFrame {
+  ExecuteTool(string request_json) => (string response_json);
+};

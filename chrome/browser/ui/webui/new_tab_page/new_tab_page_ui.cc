@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "base/base64.h"
 #include "base/command_line.h"
 #include "base/environment.h"
 #include "base/files/file_util.h"
@@ -93,6 +94,7 @@
 #include "chrome/browser/user_education/user_education_service_factory.h"
 #include "chrome/common/channel_info.h"
 #include "chrome/common/chrome_isolated_world_ids.h"
+#include "chrome/common/meweb_smart_editor.mojom.h"
 #include "chrome/common/pref_names.h"
 #include "chrome/common/search/instant_types.h"
 #include "chrome/common/url_constants.h"
@@ -141,6 +143,7 @@
 #include "media/base/media_switches.h"
 #include "mojo/public/cpp/base/big_buffer.h"
 #include "mojo/public/cpp/bindings/callback_helpers.h"
+#include "mojo/public/cpp/bindings/associated_remote.h"
 #include "net/base/net_errors.h"
 #include "net/base/url_util.h"
 #include "net/http/http_request_headers.h"
@@ -153,6 +156,7 @@
 #include "services/network/public/mojom/content_security_policy.mojom.h"
 #include "services/network/public/mojom/url_response_head.mojom.h"
 #include "skia/ext/skia_utils_base.h"
+#include "third_party/blink/public/common/associated_interfaces/associated_interface_provider.h"
 #include "third_party/omnibox_proto/chrome_aim_entry_point.pb.h"
 #include "ui/base/accelerators/accelerator.h"
 #include "ui/base/l10n/l10n_util.h"
@@ -229,6 +233,9 @@ constexpr size_t kMaxMewebIdentityTokenBytes = 64 * 1024;
 constexpr size_t kMaxMewebCredentialBytes = 16 * 1024;
 constexpr size_t kMaxMewebModelPromptBytes = 64 * 1024;
 constexpr size_t kMaxMewebModelToolsBytes = 64 * 1024;
+constexpr size_t kMaxMewebSmartEditorDocumentBytes = 512 * 1024;
+constexpr size_t kMaxMewebSmartEditorImageBytes = 10 * 1024 * 1024;
+constexpr size_t kMaxMewebSmartEditorTotalImageBytes = 20 * 1024 * 1024;
 constexpr char kMewebModelTestOriginSwitch[] = "meweb-model-test-origin";
 constexpr char kMewebMemoryCredentialStoreKey[] =
     "meweb.memory_model_credential_store";
@@ -1033,6 +1040,291 @@ class MewebAgentWorkspaceHandler
     return frames;
   }
 
+  static bool IsAllowedSmartEditorFrameUrl(const GURL& url) {
+    if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS() || url.has_username() ||
+        url.has_password()) {
+      return false;
+    }
+    if (url.host() == "blog.naver.com" || url.host() == "m.blog.naver.com" ||
+        url.host() == "blog.post.naver.com") {
+      return true;
+    }
+    const auto test_origin = ModelTestOrigin();
+    return test_origin && url.DeprecatedGetOriginAsURL() == *test_origin;
+  }
+
+  static bool IsAllowedSmartEditorImageUrl(const GURL& url) {
+    if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS() || url.has_username() ||
+        url.has_password()) {
+      return false;
+    }
+    if (url.SchemeIs("https") && url.host() == "blogfiles.pstatic.net") {
+      return true;
+    }
+    const auto test_origin = ModelTestOrigin();
+    return test_origin && url.DeprecatedGetOriginAsURL() == *test_origin;
+  }
+
+  static bool ValidateSmartEditorImage(const base::DictValue& image,
+                                       size_t* text_bytes,
+                                       int* image_count) {
+    const std::string* type = image.FindString("@ctype");
+    const std::string* src = image.FindString("src");
+    if (!type || *type != "image" || !src || src->size() > 4096 ||
+        !IsAllowedSmartEditorImageUrl(GURL(*src))) {
+      return false;
+    }
+    *text_bytes += src->size();
+    ++*image_count;
+    return *image_count <= 10;
+  }
+
+  static bool ValidateSmartEditorDocument(const base::DictValue& model) {
+    const auto* components = model.FindList("components");
+    if (!components || components->empty() || components->size() > 100) {
+      return false;
+    }
+    int title_count = 0;
+    int text_count = 0;
+    int image_count = 0;
+    size_t text_bytes = 0;
+    for (const auto& value : *components) {
+      if (!value.is_dict()) {
+        return false;
+      }
+      const auto& component = value.GetDict();
+      const std::string* type = component.FindString("@ctype");
+      if (!type) {
+        return false;
+      }
+      if (*type == "documentTitle") {
+        const std::string* text = component.FindString("text");
+        if (!text || text->empty() || text->size() > 1000) {
+          return false;
+        }
+        text_bytes += text->size();
+        ++title_count;
+      } else if (*type == "quotation") {
+        const std::string* text = component.FindString("text");
+        if (!text || text->empty() || text->size() > 20000) {
+          return false;
+        }
+        text_bytes += text->size();
+        ++text_count;
+      } else if (*type == "text") {
+        const auto* paragraphs = component.FindList("paragraphs");
+        if (!paragraphs || paragraphs->empty() || paragraphs->size() > 100) {
+          return false;
+        }
+        for (const auto& paragraph : *paragraphs) {
+          if (!paragraph.is_string() || paragraph.GetString().empty() ||
+              paragraph.GetString().size() > 20000) {
+            return false;
+          }
+          text_bytes += paragraph.GetString().size();
+        }
+        ++text_count;
+      } else if (*type == "image") {
+        if (!ValidateSmartEditorImage(component, &text_bytes, &image_count)) {
+          return false;
+        }
+      } else if (*type == "imageGroup") {
+        const auto* images = component.FindList("images");
+        if (!images || images->size() < 2 || images->size() > 10) {
+          return false;
+        }
+        for (const auto& image : *images) {
+          if (!image.is_dict() ||
+              !ValidateSmartEditorImage(image.GetDict(), &text_bytes,
+                                        &image_count)) {
+            return false;
+          }
+        }
+      } else {
+        return false;
+      }
+      if (text_bytes > kMaxMewebSmartEditorDocumentBytes) {
+        return false;
+      }
+    }
+    return title_count == 1 && text_count >= 1;
+  }
+
+  static bool ValidateSmartEditorImages(const base::DictValue& arguments) {
+    const auto* images = arguments.FindList("images");
+    if (!images || images->empty() || images->size() > 10) {
+      return false;
+    }
+    size_t total_bytes = 0;
+    for (const auto& value : *images) {
+      if (!value.is_dict()) {
+        return false;
+      }
+      const auto& image = value.GetDict();
+      const std::string* id = image.FindString("id");
+      const std::string* name = image.FindString("name");
+      const std::string* mime_type = image.FindString("mime_type");
+      const std::string* encoded = image.FindString("data_base64");
+      if (!id || id->empty() || id->size() > 128 || !name || name->empty() ||
+          name->size() > 255 || name->find('/') != std::string::npos ||
+          name->find('\\') != std::string::npos || !mime_type ||
+          (*mime_type != "image/jpeg" && *mime_type != "image/png" &&
+           *mime_type != "image/gif" && *mime_type != "image/webp") ||
+          !encoded || encoded->empty()) {
+        return false;
+      }
+      auto decoded = base::Base64Decode(*encoded);
+      if (!decoded || decoded->empty() ||
+          decoded->size() > kMaxMewebSmartEditorImageBytes) {
+        return false;
+      }
+      total_bytes += decoded->size();
+      if (total_bytes > kMaxMewebSmartEditorTotalImageBytes) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void OnSmartEditorToolExecuted(
+      std::unique_ptr<
+          mojo::AssociatedRemote<chrome::mojom::MewebSmartEditorFrame>>
+          renderer,
+      base::Value callback_id,
+      std::string tool,
+      const std::string& response_json) {
+    if (response_json.size() > kMaxMewebSmartEditorDocumentBytes * 2) {
+      Reply(callback_id,
+            AgentResult(false, "response_too_large",
+                        "SmartEditor 결과가 허용 크기를 초과했습니다."));
+      return;
+    }
+    auto parsed = base::JSONReader::Read(response_json, 0);
+    if (!parsed || !parsed->is_dict()) {
+      Reply(callback_id,
+            AgentResult(false, "execution_failed",
+                        "SmartEditor 결과 형식을 해석할 수 없습니다."));
+      return;
+    }
+    auto result = std::move(*parsed).TakeDict();
+    if (result.FindBool("ok").value_or(false)) {
+      if (tool == "set_document") {
+        const auto* normalized = result.FindDict("normalized_document_model");
+        if (!normalized || !ValidateSmartEditorDocument(*normalized)) {
+          Reply(callback_id,
+                AgentResult(false, "roundtrip_failed",
+                            "정규화된 SmartEditor 문서가 안전 기준을 충족하지 않습니다."));
+          return;
+        }
+      } else if (tool == "upload_images") {
+        const auto* resources = result.FindList("resources");
+        if (!resources || resources->empty() || resources->size() > 10) {
+          Reply(callback_id,
+                AgentResult(false, "upload_failed",
+                            "SmartEditor 이미지 리소스 결과가 올바르지 않습니다."));
+          return;
+        }
+        for (const auto& resource : *resources) {
+          const std::string* src =
+              resource.is_dict() ? resource.GetDict().FindString("src")
+                                 : nullptr;
+          if (!src || !IsAllowedSmartEditorImageUrl(GURL(*src))) {
+            Reply(callback_id,
+                  AgentResult(false, "upload_failed",
+                              "허용되지 않은 SmartEditor 이미지 주소입니다."));
+            return;
+          }
+        }
+      }
+    }
+    Reply(callback_id, std::move(result));
+  }
+
+  void ExecuteSmartEditorTool(const base::Value& callback_id,
+                              std::string_view tool,
+                              const base::DictValue& arguments,
+                              bool approved) {
+    if ((tool == "upload_images" || tool == "set_document") && !approved) {
+      auto result = AgentResult(
+          false, "approval_required",
+          tool == "upload_images"
+              ? "선택한 이미지를 네이버 SmartEditor에 업로드하려면 승인이 필요합니다."
+              : "SmartEditor 초안 문서 모델을 변경하려면 승인이 필요합니다.");
+      result.Set("risk", tool == "upload_images" ? "image_upload"
+                                                   : "draft_mutation");
+      if (tool == "upload_images") {
+        const auto* images = arguments.FindList("images");
+        result.Set("summary",
+                   base::StringPrintf("이미지 %zu개", images ? images->size() : 0));
+      } else {
+        result.Set("summary", "제목·본문·이미지 초안 반영");
+      }
+      Reply(callback_id, std::move(result));
+      return;
+    }
+    if (tool == "upload_images" && !ValidateSmartEditorImages(arguments)) {
+      Reply(callback_id,
+            AgentResult(false, "invalid_arguments",
+                        "이미지 형식, 이름 또는 크기가 허용 범위를 벗어났습니다."));
+      return;
+    }
+    if (tool == "set_document") {
+      const auto* model = arguments.FindDict("document_model");
+      if (!model || !ValidateSmartEditorDocument(*model)) {
+        Reply(callback_id,
+              AgentResult(false, "invalid_document",
+                          "SmartEditor 문서 모델 구조가 안전 기준을 충족하지 않습니다."));
+        return;
+      }
+    }
+    WebContents* target = AgentTarget();
+    std::vector<content::RenderFrameHost*> frames = AgentFrames(target);
+    const int frame_index = arguments.FindInt("frame_index").value_or(-1);
+    if (frame_index < 0 || frame_index >= static_cast<int>(frames.size()) ||
+        !frames[frame_index] || !frames[frame_index]->IsRenderFrameLive()) {
+      Reply(callback_id,
+            AgentResult(false, "stale_observation",
+                        "SmartEditor 프레임이 변경되었습니다. 다시 관찰하세요."));
+      return;
+    }
+    if (!IsAllowedSmartEditorFrameUrl(
+            frames[frame_index]->GetLastCommittedURL())) {
+      Reply(callback_id,
+            AgentResult(false, "blocked_origin",
+                        "허용된 네이버 SmartEditor 프레임이 아닙니다."));
+      return;
+    }
+    base::DictValue request;
+    request.Set("tool", tool);
+    request.Set("arguments", arguments.Clone());
+    std::string request_json;
+    if (!base::JSONWriter::Write(request, &request_json)) {
+      Reply(callback_id,
+            AgentResult(false, "invalid_arguments",
+                        "SmartEditor 요청을 만들 수 없습니다."));
+      return;
+    }
+    auto renderer = std::make_unique<
+        mojo::AssociatedRemote<chrome::mojom::MewebSmartEditorFrame>>();
+    frames[frame_index]->GetRemoteAssociatedInterfaces()->GetInterface(
+        renderer.get());
+    if (!renderer->is_bound()) {
+      Reply(callback_id,
+            AgentResult(false, "execution_failed",
+                        "SmartEditor 렌더러에 연결할 수 없습니다."));
+      return;
+    }
+    auto* proxy = renderer->get();
+    proxy->ExecuteTool(
+        request_json,
+        mojo::WrapCallbackWithDefaultInvokeIfNotRun(
+            base::BindOnce(
+                &MewebAgentWorkspaceHandler::OnSmartEditorToolExecuted,
+                weak_ptr_factory_.GetWeakPtr(), std::move(renderer),
+                callback_id.Clone(), std::string(tool)),
+            R"({"ok":false,"status":"execution_failed","message":"SmartEditor 렌더러 연결이 중단됐습니다."})"));
+  }
+
   void HandleAgentObserve(const base::ListValue& args) {
     if (args.size() != 1 || !args[0].is_string()) {
       return;
@@ -1179,6 +1471,12 @@ class MewebAgentWorkspaceHandler
       return;
     }
     const std::string& tool = args[1].GetString();
+    if (args[2].GetString().size() >
+        kMaxMewebSmartEditorTotalImageBytes * 2) {
+      Reply(args[0], AgentResult(false, "invalid_arguments",
+                                 "도구 요청 크기가 허용 범위를 벗어났습니다."));
+      return;
+    }
     auto parsed = base::JSONReader::Read(args[2].GetString(), 0);
     if (!parsed || !parsed->is_dict()) {
       Reply(args[0], AgentResult(false, "invalid_arguments",
@@ -1222,6 +1520,12 @@ class MewebAgentWorkspaceHandler
       result.Set("url", url.spec());
       Reply(args[0], std::move(result));
 #endif
+      return;
+    }
+
+    if (tool == "inspect_editor" || tool == "upload_images" ||
+        tool == "set_document") {
+      ExecuteSmartEditorTool(args[0], tool, arguments, approved);
       return;
     }
 

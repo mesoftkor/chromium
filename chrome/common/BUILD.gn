@@ -674,6 +674,7 @@ mojom("mojo_bindings") {
     "chrome_render_frame.mojom",
     "google_accounts_private_api_extension.mojom",
     "media/webrtc_logging.mojom",
+    "meweb_smart_editor.mojom",
     "net/net_error_page_support.mojom",
     "net_benchmarking.mojom",
     "network_diagnostics.mojom",

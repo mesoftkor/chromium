@@ -282,6 +282,13 @@
     .agent-composer { flex:none; padding:10px 12px 12px; border-top:1px solid var(--line-soft); background:var(--surface); }
     .agent-composer textarea { width:100%; min-height:64px; max-height:150px; resize:vertical; padding:9px 10px; color:var(--fg); border:1px solid var(--line); border-radius:9px; outline:0; background:var(--surface-2); }
     .agent-composer textarea:focus { border-color:var(--accent); }
+    .agent-attachments { margin-top:7px; }
+    .agent-attachment-actions { display:flex; align-items:center; gap:7px; }
+    .agent-attachment-actions span { color:var(--dim); font-size:.7em; }
+    .agent-attachment-list { display:flex; flex-wrap:wrap; gap:5px; margin-top:6px; }
+    .agent-attachment { display:flex; align-items:center; gap:4px; max-width:100%; padding:4px 6px; border:1px solid var(--line-soft); border-radius:7px; background:var(--surface-2); }
+    .agent-attachment span { max-width:180px; overflow:hidden; color:var(--muted); font-size:.68em; text-overflow:ellipsis; white-space:nowrap; }
+    .agent-attachment button { width:18px; height:18px; padding:0; color:var(--dim); border:0; background:transparent; }
     .agent-composer-actions { display:flex; align-items:center; gap:7px; margin-top:7px; }
     .agent-composer-actions .agent-status { flex:1; min-width:0; color:var(--dim); font-size:.7em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     body.agent-side-panel #mewebAgentWorkspace { display:none; }
@@ -413,6 +420,11 @@
     </div>
     <footer class="agent-composer">
       <textarea id="agentGoalInput" maxlength="65536" placeholder="현재 탭에서 할 일을 입력하세요. 예: 제목과 본문을 채우고 발행 직전에서 멈춰줘"></textarea>
+      <div class="agent-attachments">
+        <input id="agentImageInput" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+        <div class="agent-attachment-actions"><button class="btn" id="agentImageButton">이미지 추가</button><span id="agentImageSummary">첨부 이미지 없음 · 앱 메모리에만 보관</span></div>
+        <div class="agent-attachment-list" id="agentImageList" hidden></div>
+      </div>
       <div class="agent-composer-actions"><span class="agent-status" id="agentStatus">대기 중</span><button class="btn danger" id="agentStopButton" hidden>중단</button><button class="btn primary" id="agentRunButton">실행</button></div>
     </footer>
   </aside>

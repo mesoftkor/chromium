@@ -14,6 +14,7 @@
 #include "chrome/common/actor.mojom.h"
 #include "chrome/common/buildflags.h"
 #include "chrome/common/chrome_render_frame.mojom.h"
+#include "chrome/common/meweb_smart_editor.mojom.h"
 #include "chrome/renderer/actor/tool_executor.h"
 #include "components/actor/core/task_id.h"  // nogncheck
 #include "components/page_content_annotations/content/mojom/page_stability.mojom.h"
@@ -59,7 +60,8 @@ class WebCacheImpl;
 // This class holds the Chrome specific parts of RenderFrame, and has the same
 // lifetime.
 class ChromeRenderFrameObserver : public content::RenderFrameObserver,
-                                  public chrome::mojom::ChromeRenderFrame {
+                                  public chrome::mojom::ChromeRenderFrame,
+                                  public chrome::mojom::MewebSmartEditorFrame {
  public:
   ChromeRenderFrameObserver(content::RenderFrame* render_frame,
                             web_cache::WebCacheImpl* web_cache_impl);
@@ -138,7 +140,8 @@ class ChromeRenderFrameObserver : public content::RenderFrameObserver,
   void InitializeTool(actor::mojom::ToolInvocationPtr request,
                       InitializeToolCallback callback) override;
   void ExecuteTool(const actor::TaskId& task_id,
-                   ExecuteToolCallback callback) override;
+                   chrome::mojom::ChromeRenderFrame::ExecuteToolCallback
+                       callback) override;
   void InvokeTool(actor::mojom::ToolInvocationPtr request,
                   InvokeToolCallback callback) override;
   void CancelTool(const actor::TaskId& task_id) override;
@@ -148,6 +151,11 @@ class ChromeRenderFrameObserver : public content::RenderFrameObserver,
   void GetCrossDocumentScriptToolResult(
       const base::UnguessableToken& execution_id,
       GetCrossDocumentScriptToolResultCallback callback) override;
+
+  // chrome::mojom::MewebSmartEditorFrame:
+  void ExecuteTool(const std::string& request_json,
+                   chrome::mojom::MewebSmartEditorFrame::ExecuteToolCallback
+                       callback) override;
   // Multiple calls will clobber a PageStabilityMonitor previously created and
   // it's the caller's responsibility to ensure the monitor is unneeded before
   // creating a new one.
@@ -171,6 +179,9 @@ class ChromeRenderFrameObserver : public content::RenderFrameObserver,
 
   void OnRenderFrameObserverRequest(
       mojo::PendingAssociatedReceiver<chrome::mojom::ChromeRenderFrame>
+          receiver);
+  void OnMewebSmartEditorRequest(
+      mojo::PendingAssociatedReceiver<chrome::mojom::MewebSmartEditorFrame>
           receiver);
 
   // Captures page information using the top (main) frame of a frame tree.
@@ -229,6 +240,8 @@ class ChromeRenderFrameObserver : public content::RenderFrameObserver,
       page_stability_monitor_;
 
   mojo::AssociatedReceiverSet<chrome::mojom::ChromeRenderFrame> receivers_;
+  mojo::AssociatedReceiverSet<chrome::mojom::MewebSmartEditorFrame>
+      meweb_smart_editor_receivers_;
 
   service_manager::BinderRegistry registry_;
   blink::AssociatedInterfaceRegistry associated_interfaces_;

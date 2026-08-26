@@ -16,13 +16,17 @@
 #include "base/base_switches.h"
 #include "base/command_line.h"
 #include "base/functional/bind.h"
+#include "base/json/json_writer.h"
+#include "base/json/string_escape.h"
 #include "base/no_destructor.h"
 #include "base/strings/string_number_conversions.h"
+#include "base/strings/strcat.h"
 #include "base/strings/string_util.h"
 #include "base/strings/utf_string_conversions.h"
 #include "base/synchronization/lock.h"
 #include "base/time/time.h"
 #include "base/trace_event/trace_event.h"
+#include "base/values.h"
 #include "build/build_config.h"
 #include "chrome/common/chrome_constants.h"
 #include "chrome/common/chrome_features.h"
@@ -55,6 +59,7 @@
 #include "content/public/common/buildflags.h"
 #include "content/public/common/content_features.h"
 #include "content/public/common/content_switches.h"
+#include "content/public/common/isolated_world_ids.h"
 #include "content/public/renderer/render_frame.h"
 #include "content/public/renderer/render_frame_visitor.h"
 #include "content/public/renderer/render_thread.h"
@@ -64,6 +69,8 @@
 #include "skia/ext/image_operations.h"
 #include "third_party/blink/public/common/associated_interfaces/associated_interface_provider.h"
 #include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
+#include "third_party/blink/public/platform/scheduler/web_agent_group_scheduler.h"
+#include "third_party/blink/public/platform/web_string.h"
 #include "third_party/blink/public/platform/web_url_request.h"
 #include "third_party/blink/public/web/web_console_message.h"
 #include "third_party/blink/public/web/web_document.h"
@@ -73,6 +80,7 @@
 #include "third_party/blink/public/web/web_local_frame.h"
 #include "third_party/blink/public/web/web_local_frame_client.h"
 #include "third_party/blink/public/web/web_node.h"
+#include "third_party/blink/public/web/web_script_source.h"
 #include "third_party/blink/public/web/web_security_policy.h"
 #include "third_party/blink/public/web/web_view.h"
 #include "third_party/libwebp/src/src/webp/decode.h"
@@ -82,6 +90,7 @@
 #include "ui/gfx/codec/webp_codec.h"
 #include "ui/gfx/geometry/size_f.h"
 #include "url/gurl.h"
+#include "v8/include/v8-isolate.h"
 
 #if !BUILDFLAG(IS_ANDROID)
 #include "chrome/renderer/accessibility/read_anything/read_anything_app_controller.h"
@@ -128,6 +137,207 @@ const char kImageGif[] = "image/gif";
 const char kImageJpeg[] = "image/jpeg";
 const char kImagePng[] = "image/png";
 const char kImageWebp[] = "image/webp";
+
+constexpr size_t kMaxMewebSmartEditorRequestBytes = 32 * 1024 * 1024;
+
+bool IsAllowedMewebSmartEditorFrame(const GURL& url) {
+  if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS() || url.has_username() ||
+      url.has_password()) {
+    return false;
+  }
+  if (url.host() == "blog.naver.com" || url.host() == "m.blog.naver.com" ||
+      url.host() == "blog.post.naver.com") {
+    return true;
+  }
+#if !defined(OFFICIAL_BUILD)
+  return url.host() == "127.0.0.1" || url.host() == "localhost" ||
+         url.host() == "[::1]" || url.host() == "::1";
+#else
+  return false;
+#endif
+}
+
+std::string MewebSmartEditorError(std::string_view status,
+                                  std::string_view message) {
+  base::DictValue result;
+  result.Set("ok", false);
+  result.Set("status", status);
+  result.Set("message", message);
+  std::string serialized;
+  base::JSONWriter::Write(result, &serialized);
+  return serialized;
+}
+
+std::string MewebSmartEditorScript(std::string_view request_json) {
+  return base::StrCat({R"JS(
+    (async () => {
+      const request = JSON.parse()JS",
+                       base::GetQuotedJSONString(request_json), R"JS();
+      const fail = (status, message) => ({ok: false, status, message});
+      const findEditor = () => globalThis.SmartEditor?._editors?.blogpc001;
+      let editor = findEditor();
+      const readyDeadline = Date.now() + 30000;
+      while (!editor && Date.now() < readyDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        editor = findEditor();
+      }
+      if (!editor) {
+        return JSON.stringify(fail(
+            'editor_not_ready', 'SmartEditor ONE 편집기가 아직 준비되지 않았습니다.'));
+      }
+      const owners = [editor, editor._documentModel, editor.documentModel]
+          .filter(Boolean);
+      const method = name => {
+        const owner = owners.find(candidate => typeof candidate?.[name] === 'function');
+        return owner ? owner[name].bind(owner) : null;
+      };
+      const getDocumentData = method('getDocumentData') || method('getData');
+      const setDocumentData = method('setDocumentData') || method('setData');
+      const summarize = model => {
+        const components = Array.isArray(model?.components) ? model.components : [];
+        const types = components.map(component => String(component?.['@ctype'] || ''));
+        const countNestedImages = component => {
+          if (component?.['@ctype'] === 'image') return 1;
+          if (component?.['@ctype'] === 'imageGroup' && Array.isArray(component.images)) {
+            return component.images.filter(image => image?.['@ctype'] === 'image').length;
+          }
+          return 0;
+        };
+        return {
+          component_count: components.length,
+          component_types: types,
+          title_count: types.filter(type => type === 'documentTitle').length,
+          text_count: types.filter(type => type === 'text' || type === 'quotation').length,
+          image_count: components.reduce(
+              (count, component) => count + countNestedImages(component), 0),
+        };
+      };
+      if (request.tool === 'inspect_editor') {
+        let documentModel = null;
+        if (getDocumentData) {
+          documentModel = await Promise.resolve(getDocumentData());
+        }
+        return JSON.stringify({
+          ok: true,
+          status: 'smarteditor_ready',
+          message: 'SmartEditor ONE 문서 모델 연결을 확인했습니다.',
+          ready: true,
+          capabilities: {
+            get_document: Boolean(getDocumentData),
+            set_document: Boolean(setDocumentData),
+            upload_images: Boolean(
+                editor?._videoUploadService?._imageUploadService
+                    ?.uploadImagesFromFiles ||
+                editor?._imageUploadService?.uploadImagesFromFiles),
+          },
+          summary: summarize(documentModel),
+        });
+      }
+      if (request.tool === 'upload_images') {
+        const service = editor?._videoUploadService?._imageUploadService ||
+            editor?._imageUploadService;
+        if (!service || typeof service.createSourceList !== 'function' ||
+            typeof service.uploadImagesFromFiles !== 'function') {
+          return JSON.stringify(fail(
+              'unsupported_editor', 'SmartEditor 이미지 업로드 연결을 찾을 수 없습니다.'));
+        }
+        const images = Array.isArray(request.arguments?.images) ?
+            request.arguments.images : [];
+        if (!images.length || images.length > 10) {
+          return JSON.stringify(fail(
+              'invalid_arguments', '업로드 이미지는 한 번에 1~10개여야 합니다.'));
+        }
+        const files = images.map(image => {
+          const binary = atob(String(image.data_base64 || ''));
+          const bytes = new Uint8Array(binary.length);
+          for (let index = 0; index < binary.length; ++index) {
+            bytes[index] = binary.charCodeAt(index);
+          }
+          return new File([bytes], String(image.name || 'meweb-image'), {
+            type: String(image.mime_type || 'application/octet-stream'),
+            lastModified: Date.now(),
+          });
+        });
+        const ids = images.map((image, index) =>
+          String(image.id || `meweb-${Date.now()}-${index}`));
+        const sourceList = service.createSourceList(ids, files);
+        const uploadedValue = await Promise.race([
+          Promise.resolve(service.uploadImagesFromFiles(sourceList)),
+          new Promise((_, reject) => setTimeout(
+              () => reject(new Error('image upload timeout')), 60000)),
+        ]);
+        const uploaded = Array.isArray(uploadedValue) ? uploadedValue :
+            Array.isArray(uploadedValue?.images) ? uploadedValue.images :
+            Array.isArray(uploadedValue?.resources) ? uploadedValue.resources :
+            uploadedValue ? [uploadedValue] : [];
+        const resources = uploaded.map((value, index) => {
+          const resource = value?.resource || value || {};
+          const domain = String(resource.domain || '');
+          const path = String(resource.path || '');
+          return {
+            id: ids[index] || '',
+            name: images[index]?.name || '',
+            domain,
+            path,
+            width: Number(resource.width || 0),
+            height: Number(resource.height || 0),
+            src: String(resource.src ||
+                (domain && path ? `https://${domain}${path}` : '')),
+          };
+        }).filter(resource => resource.src || (resource.domain && resource.path));
+        if (resources.length !== files.length) {
+          return JSON.stringify(fail(
+              'upload_failed', 'SmartEditor가 모든 이미지 리소스를 반환하지 않았습니다.'));
+        }
+        return JSON.stringify({
+          ok: true,
+          status: 'images_uploaded',
+          message: `${resources.length}개 이미지를 SmartEditor에 업로드했습니다.`,
+          uploaded_count: resources.length,
+          resources,
+        });
+      }
+      if (request.tool === 'set_document') {
+        if (!setDocumentData || !getDocumentData) {
+          return JSON.stringify(fail(
+              'unsupported_editor', 'SmartEditor 문서 모델 왕복 연결을 찾을 수 없습니다.'));
+        }
+        const model = request.arguments?.document_model;
+        const components = Array.isArray(model?.components) ? model.components : [];
+        const allowed = new Set([
+          'documentTitle', 'quotation', 'text', 'image', 'imageGroup'
+        ]);
+        if (!components.length ||
+            components.some(component => !allowed.has(component?.['@ctype']))) {
+          return JSON.stringify(fail(
+              'invalid_document', '허용되지 않은 SmartEditor 문서 컴포넌트입니다.'));
+        }
+        await Promise.resolve(setDocumentData(
+            model, request.arguments?.population_params || {}));
+        const normalized = await Promise.resolve(getDocumentData());
+        const summary = summarize(normalized);
+        if (summary.title_count !== 1 || summary.text_count < 1) {
+          return JSON.stringify(fail(
+              'roundtrip_failed', '정규화된 문서에서 제목 또는 본문을 확인할 수 없습니다.'));
+        }
+        return JSON.stringify({
+          ok: true,
+          status: 'document_roundtrip_verified',
+          message: 'setDocumentData와 getDocumentData 왕복 정규화를 확인했습니다.',
+          normalized_document_model: normalized,
+          summary,
+          ready_for_review: true,
+        });
+      }
+      return JSON.stringify(fail(
+          'unsupported_tool', '지원하지 않는 SmartEditor 도구입니다.'));
+    })().catch(error => JSON.stringify({
+      ok: false,
+      status: 'editor_error',
+      message: 'SmartEditor 내부 작업이 실패했습니다.',
+    }));
+  )JS"});
+}
 
 #if BUILDFLAG(IS_ANDROID)
 base::Lock& GetFrameHeaderMapLock() {
@@ -215,6 +425,11 @@ ChromeRenderFrameObserver::ChromeRenderFrameObserver(
       ->AddInterface<chrome::mojom::ChromeRenderFrame>(base::BindRepeating(
           &ChromeRenderFrameObserver::OnRenderFrameObserverRequest,
           base::Unretained(this)));
+  render_frame->GetAssociatedInterfaceRegistry()
+      ->AddInterface<chrome::mojom::MewebSmartEditorFrame>(
+          base::BindRepeating(
+              &ChromeRenderFrameObserver::OnMewebSmartEditorRequest,
+              base::Unretained(this)));
 
   // Don't do anything else for subframes.
   if (!render_frame->IsMainFrame())
@@ -682,7 +897,7 @@ void ChromeRenderFrameObserver::InitializeTool(
 }
 
 void ChromeRenderFrameObserver::ExecuteTool(const actor::TaskId& task_id,
-                                            ExecuteToolCallback callback) {
+    chrome::mojom::ChromeRenderFrame::ExecuteToolCallback callback) {
   CHECK(tool_executor_) << "ExecuteTool was called before InitializeTool";
   tool_executor_->ExecuteTool(task_id, std::move(callback));
 }
@@ -764,6 +979,53 @@ void ChromeRenderFrameObserver::OnRenderFrameObserverRequest(
     mojo::PendingAssociatedReceiver<chrome::mojom::ChromeRenderFrame>
         receiver) {
   receivers_.Add(this, std::move(receiver));
+}
+
+void ChromeRenderFrameObserver::OnMewebSmartEditorRequest(
+    mojo::PendingAssociatedReceiver<chrome::mojom::MewebSmartEditorFrame>
+        receiver) {
+  meweb_smart_editor_receivers_.Add(this, std::move(receiver));
+}
+
+void ChromeRenderFrameObserver::ExecuteTool(
+    const std::string& request_json,
+    chrome::mojom::MewebSmartEditorFrame::ExecuteToolCallback callback) {
+  WebLocalFrame* frame = render_frame()->GetWebFrame();
+  const GURL url = frame ? GURL(frame->GetDocument().Url()) : GURL();
+  if (!frame || !IsAllowedMewebSmartEditorFrame(url)) {
+    std::move(callback).Run(MewebSmartEditorError(
+        "blocked_origin", "SmartEditor 도구를 실행할 수 없는 프레임입니다."));
+    return;
+  }
+  if (request_json.empty() ||
+      request_json.size() > kMaxMewebSmartEditorRequestBytes) {
+    std::move(callback).Run(MewebSmartEditorError(
+        "invalid_arguments", "SmartEditor 요청 크기가 허용 범위를 벗어났습니다."));
+    return;
+  }
+  v8::HandleScope handle_scope(frame->GetAgentGroupScheduler()->Isolate());
+  blink::WebScriptSource source(
+      blink::WebString::FromUtf8(MewebSmartEditorScript(request_json)));
+  frame->RequestExecuteScript(
+      content::ISOLATED_WORLD_ID_GLOBAL, base::span_from_ref(source),
+      blink::mojom::UserActivationOption::kDoNotActivate,
+      blink::mojom::EvaluationTiming::kAsynchronous,
+      blink::mojom::LoadEventBlockingOption::kDoNotBlock,
+      base::BindOnce(
+          [](chrome::mojom::MewebSmartEditorFrame::ExecuteToolCallback callback,
+             std::optional<base::Value> result, base::TimeTicks) {
+            if (!result || !result->is_string()) {
+              std::move(callback).Run(MewebSmartEditorError(
+                  "execution_failed",
+                  "SmartEditor 렌더러가 결과를 반환하지 못했습니다."));
+              return;
+            }
+            std::move(callback).Run(result->GetString());
+          },
+          std::move(callback)),
+      blink::BackForwardCacheAware::kAllow,
+      blink::mojom::WantResultOption::kWantResult,
+      blink::mojom::PromiseResultOption::kAwait);
 }
 
 bool ChromeRenderFrameObserver::ShouldCapturePageTextForTranslateOrPhishing(

@@ -554,6 +554,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       '1';
   let agentRunSequence = 0;
   let agentApprovalResolver = null;
+  let agentImageAttachments = [];
   let agentRuntime = {
     status: 'idle', message: '대기 중', goal: '', observation: null,
     messages: [{role: 'system', text: '현재 탭을 관찰한 뒤 안전한 동작만 실행합니다. 발행·게시·임시저장은 항상 차단됩니다.'}],
@@ -565,6 +566,9 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     {name: 'click', description: '가장 최근 DOM 관찰에서 받은 참조값의 요소를 클릭합니다. 발행·게시·임시저장 클릭은 실행 계층에서 차단됩니다.', parameters: {type: 'object', properties: {frame_index: {type: 'integer'}, ref: {type: 'string'}}, required: ['frame_index', 'ref'], additionalProperties: false}},
     {name: 'type', description: '가장 최근 DOM 관찰에서 받은 입력 요소에 문자를 입력합니다.', parameters: {type: 'object', properties: {frame_index: {type: 'integer'}, ref: {type: 'string'}, text: {type: 'string'}}, required: ['frame_index', 'ref', 'text'], additionalProperties: false}},
     {name: 'scroll', description: '현재 프레임을 지정한 픽셀만큼 스크롤합니다.', parameters: {type: 'object', properties: {frame_index: {type: 'integer'}, x: {type: 'number'}, y: {type: 'number'}}, required: ['frame_index', 'y'], additionalProperties: false}},
+    {name: 'inspect_editor', description: 'SmartEditor ONE 프레임의 documentModel get/set 및 이미지 업로드 연결 상태를 검사합니다. SmartEditor 프레임을 관찰한 직후 먼저 호출합니다.', parameters: {type: 'object', properties: {frame_index: {type: 'integer'}}, required: ['frame_index'], additionalProperties: false}},
+    {name: 'upload_images', description: '사용자가 AI Agent에 첨부한 이미지를 SmartEditor 내부 uploadImagesFromFiles로 업로드하고 documentModel용 리소스를 반환합니다. 외부 업로드이므로 사용자 승인이 필요합니다.', parameters: {type: 'object', properties: {frame_index: {type: 'integer'}, attachment_ids: {type: 'array', items: {type: 'string'}, minItems: 1, maxItems: 10}}, required: ['frame_index', 'attachment_ids'], additionalProperties: false}},
+    {name: 'set_document', description: '제목·본문·이미지 documentModel을 SmartEditor setDocumentData로 반영한 뒤 getDocumentData로 왕복 정규화합니다. 발행이나 임시저장은 실행하지 않습니다.', parameters: {type: 'object', properties: {frame_index: {type: 'integer'}, document_model: {type: 'object'}, population_params: {type: 'object'}}, required: ['frame_index', 'document_model'], additionalProperties: false}},
     {name: 'ask_user', description: '로그인, 모호한 지시 또는 사용자가 직접 해야 하는 작업이 있어 실행을 멈춥니다.', parameters: {type: 'object', properties: {message: {type: 'string'}}, required: ['message'], additionalProperties: false}},
     {name: 'finish', description: '목표를 검증한 뒤 종료합니다. 발행 직전 초안은 READY_FOR_REVIEW 상태로 종료합니다.', parameters: {type: 'object', properties: {status: {type: 'string', enum: ['COMPLETED', 'READY_FOR_REVIEW', 'ABORTED']}, message: {type: 'string'}, evidence: {type: 'object'}}, required: ['status', 'message'], additionalProperties: false}},
   ];
@@ -941,6 +945,15 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     $('#agentRunButton').disabled =
         agentRuntime.status === 'running' || !connected;
     $('#agentStopButton').hidden = agentRuntime.status !== 'running';
+    const imageList = $('#agentImageList');
+    imageList.hidden = !agentImageAttachments.length;
+    setHtml(imageList, agentImageAttachments.map(attachment =>
+      `<div class="agent-attachment"><span title="${esc(attachment.name)}">${esc(attachment.name)} · ${Math.max(1, Math.ceil(attachment.size / 1024))}KB</span><button data-remove-agent-image="${esc(attachment.id)}" title="첨부 제거">×</button></div>`).join(''));
+    $('#agentImageSummary').textContent = agentImageAttachments.length ?
+        `${agentImageAttachments.length}개 이미지 · 앱 메모리에만 보관` :
+        '첨부 이미지 없음 · 앱 메모리에만 보관';
+    $('#agentImageButton').disabled =
+        agentRuntime.status === 'running' || agentImageAttachments.length >= 10;
     const body = $('#agentPanelBody');
     if (body && agentRuntime.status === 'running') {
       requestAnimationFrame(() => { body.scrollTop = body.scrollHeight; });
@@ -1269,6 +1282,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
 짧은 계획으로 한 번에 도구 하나만 호출하고, 실행 뒤 반드시 다시 관찰해 결과를 검증한다.
 로그인, 캡차, 결제, 외부 전송, 삭제 또는 허용 목록 밖 이동은 ask_user로 멈춘다.
 발행, 게시, 예약 발행, 임시저장 버튼은 어떤 경우에도 클릭하지 않는다. 초안이 화면에 반영됐음을 확인하면 finish의 READY_FOR_REVIEW로 종료한다.
+SmartEditor ONE 프레임을 발견하면 일반 DOM 입력 대신 inspect_editor로 준비 상태를 확인한다. 사용자가 첨부한 이미지는 upload_images로 업로드하고 반환된 리소스로 document_model을 만든 뒤 set_document 왕복 결과를 검증한다.
 목표를 달성했거나 안전하게 더 진행할 수 없을 때만 finish 또는 ask_user를 호출한다.`;
 
   function setAgentPlan(activeIndex, finalStatus = '') {
@@ -1319,7 +1333,13 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
         elements: frame.elements || [],
       })),
     });
-    return `사용자 목표:\n${goal}\n\n최신 DOM 관찰:\n${compactObservation}\n\n이전 실행 결과:\n${transcript.slice(-12000)}\n\n최신 관찰만 근거로 다음 도구 하나를 호출하라.`.slice(0, 62000);
+    const attachments = JSON.stringify(agentImageAttachments.map(attachment => ({
+      id: attachment.id,
+      name: attachment.name,
+      mime_type: attachment.mime_type,
+      size: attachment.size,
+    })));
+    return `사용자 목표:\n${goal}\n\n사용자 첨부 이미지:\n${attachments}\n\n최신 DOM 관찰:\n${compactObservation}\n\n이전 실행 결과:\n${transcript.slice(-12000)}\n\n최신 관찰만 근거로 다음 도구 하나를 호출하라.`.slice(0, 62000);
   }
 
   async function requestAgentDecision(goal, observation, transcript) {
@@ -1349,7 +1369,31 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
         JSON.stringify(AGENT_TOOLS), runtime.runtime.retry_limit_per_action);
   }
 
-  async function waitForAgentApproval(result, tool, argumentsValue, runId) {
+  function prepareAgentNativeArguments(tool, argumentsValue) {
+    const nativeArguments = JSON.parse(JSON.stringify(argumentsValue || {}));
+    if (tool !== 'upload_images') return {ok: true, nativeArguments};
+    const ids = Array.isArray(nativeArguments.attachment_ids) ?
+        [...new Set(nativeArguments.attachment_ids.map(String))] : [];
+    const images = ids.map(id =>
+      agentImageAttachments.find(attachment => attachment.id === id));
+    if (!ids.length || images.some(image => !image)) {
+      return {ok: false, result: {
+        ok: false, status: 'missing_attachment',
+        message: '모델이 선택한 첨부 이미지를 현재 앱 메모리에서 찾을 수 없습니다.',
+      }};
+    }
+    nativeArguments.images = images.map(image => ({
+      id: image.id,
+      name: image.name,
+      mime_type: image.mime_type,
+      data_base64: image.data_base64,
+    }));
+    delete nativeArguments.attachment_ids;
+    return {ok: true, nativeArguments};
+  }
+
+  async function waitForAgentApproval(
+      result, tool, argumentsValue, nativeArguments, runId) {
     agentRuntime.pendingApproval = {
       result, tool, argumentsValue,
       message: result.message || '이 동작은 승인이 필요합니다.',
@@ -1368,18 +1412,74 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     agentRuntime.message = '승인된 동작 실행 중';
     renderAgentPanel();
     return sendModelAuthRequest(
-        'mewebAgentExecute', tool, JSON.stringify(argumentsValue), true);
+        'mewebAgentExecute', tool, JSON.stringify(nativeArguments), true);
   }
 
   async function executeAgentTool(call, runId) {
     const argumentsValue = parseAgentArguments(call);
+    const prepared = prepareAgentNativeArguments(call.name, argumentsValue);
+    if (!prepared.ok) return {result: prepared.result, argumentsValue};
+    const nativeArguments = prepared.nativeArguments;
     let result = await sendModelAuthRequest(
-        'mewebAgentExecute', call.name, JSON.stringify(argumentsValue), false);
+        'mewebAgentExecute', call.name, JSON.stringify(nativeArguments), false);
     if (result?.status === 'approval_required') {
       result = await waitForAgentApproval(
-          result, call.name, argumentsValue, runId);
+          result, call.name, argumentsValue, nativeArguments, runId);
     }
     return {result, argumentsValue};
+  }
+
+  async function executeAgentToolDirect(name, argumentsValue, approved) {
+    const prepared = prepareAgentNativeArguments(name, argumentsValue || {});
+    if (!prepared.ok) return prepared.result;
+    return sendModelAuthRequest(
+        'mewebAgentExecute', name,
+        JSON.stringify(prepared.nativeArguments), approved === true);
+  }
+
+  function compactAgentToolResult(result) {
+    if (!result || typeof result !== 'object') return result;
+    const compact = JSON.parse(JSON.stringify(result));
+    if (compact.normalized_document_model) {
+      compact.normalized_document_model = '[검증 완료된 문서 모델은 UI에만 보관]';
+    }
+    return compact;
+  }
+
+  function arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    for (let offset = 0; offset < bytes.length; offset += 32768) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + 32768));
+    }
+    return btoa(binary);
+  }
+
+  async function addAgentImageFiles(files) {
+    const allowed = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+    const next = [];
+    let totalBytes = agentImageAttachments.reduce(
+        (sum, attachment) => sum + attachment.size, 0);
+    for (const file of Array.from(files || [])) {
+      if (agentImageAttachments.length + next.length >= 10) break;
+      if (!allowed.has(file.type) || file.size < 1 || file.size > 10 * 1024 * 1024 ||
+          totalBytes + file.size > 20 * 1024 * 1024) {
+        toast('이미지는 JPG·PNG·GIF·WebP, 파일당 10MB·전체 20MB 이하만 첨부할 수 있습니다.');
+        continue;
+      }
+      const id = `image-${Date.now()}-${agentImageAttachments.length + next.length + 1}`;
+      next.push({
+        id,
+        name: file.name.replace(/[\\/]/g, '-').slice(0, 255) || 'meweb-image',
+        mime_type: file.type,
+        size: file.size,
+        data_base64: arrayBufferToBase64(await file.arrayBuffer()),
+      });
+      totalBytes += file.size;
+    }
+    agentImageAttachments = agentImageAttachments.concat(next);
+    renderAgentPanel();
+    return next.length;
   }
 
   function completeAgent(status, message, role = 'assistant') {
@@ -1504,7 +1604,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
           throw new Error(result?.message || `${call.name} 도구 실행에 실패했습니다.`);
         }
         retryCount = 0;
-        transcript += `\n도구 ${call.name}(${JSON.stringify(argumentsValue).slice(0, 1500)}) 결과: ${JSON.stringify(result).slice(0, 2000)}`;
+        transcript += `\n도구 ${call.name}(${JSON.stringify(argumentsValue).slice(0, 1500)}) 결과: ${JSON.stringify(compactAgentToolResult(result)).slice(0, 2000)}`;
         await new Promise(resolve => setTimeout(resolve,
             call.name === 'navigate' ? 900 : 250));
       }
@@ -1544,6 +1644,13 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
   }
 
   document.addEventListener('click', event => {
+    const removeAgentImageTarget = event.target.closest('[data-remove-agent-image]');
+    if (removeAgentImageTarget) {
+      agentImageAttachments = agentImageAttachments.filter(
+          attachment => attachment.id !== removeAgentImageTarget.dataset.removeAgentImage);
+      renderAgentPanel();
+      return;
+    }
     const removeLinkTarget = event.target.closest('[data-remove-link]');
     if (removeLinkTarget) {
       event.stopPropagation();
@@ -1588,6 +1695,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
         chrome.send('mewebAgentShowSidePanel');
         break;
       case 'agentRunButton': runAgent(); break;
+      case 'agentImageButton': $('#agentImageInput').click(); break;
       case 'agentStopButton': stopAgent(); break;
       case 'agentConnectButton': connectAgentProvider(); break;
       case 'agentRefreshButton':
@@ -1643,6 +1751,12 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     if (event.target.id === 'modelTestPromptInput') { modelTestPrompt = event.target.value; }
   });
 
+  document.addEventListener('change', event => {
+    if (event.target.id !== 'agentImageInput') return;
+    const input = event.target;
+    addAgentImageFiles(input.files).finally(() => { input.value = ''; });
+  });
+
   document.addEventListener('keydown', event => {
     if (event.target.id === 'agentGoalInput' && event.key === 'Enter' &&
         (event.metaKey || event.ctrlKey)) {
@@ -1671,7 +1785,11 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
   window.mewebAgentTest = {
     getState: () => JSON.parse(JSON.stringify(state)),
     getProgress: () => taskProgress(),
-    reset: () => { state = defaults(); save(); renderAll(); },
+    reset: () => {
+      state = defaults();
+      agentImageAttachments = [];
+      save(); renderAll();
+    },
     openView: view => switchView(view),
     setAutonomy: value => { state.persona.autonomy = value; state.task.decisions = {}; save(); renderAll(); },
     getModelRuntimeConfig: () => JSON.parse(JSON.stringify(effectiveModelRuntime())),
@@ -1697,9 +1815,27 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     })),
     observeAgentTarget: () => observeAgentTarget(),
     executeAgentTool: (name, argumentsValue, approved = false) =>
-      sendModelAuthRequest(
-          'mewebAgentExecute', name, JSON.stringify(argumentsValue || {}),
-          approved === true),
+      executeAgentToolDirect(name, argumentsValue, approved),
+    setAgentImageAttachments: attachments => {
+      agentImageAttachments = Array.isArray(attachments) ? attachments.slice(0, 10).map(
+        (attachment, index) => ({
+          id: String(attachment.id || `image-test-${index + 1}`).slice(0, 128),
+          name: String(attachment.name || `image-${index + 1}.png`)
+              .replace(/[\\/]/g, '-').slice(0, 255),
+          mime_type: String(attachment.mime_type || 'image/png'),
+          size: Number(attachment.size || Math.floor(
+              String(attachment.data_base64 || '').length * 3 / 4)),
+          data_base64: String(attachment.data_base64 || ''),
+        })) : [];
+      renderAgentPanel();
+      return agentImageAttachments.length;
+    },
+    getAgentImageAttachments: () => agentImageAttachments.map(attachment => ({
+      id: attachment.id,
+      name: attachment.name,
+      mime_type: attachment.mime_type,
+      size: attachment.size,
+    })),
     runAgent: goal => runAgent(goal),
     stopAgent: () => stopAgent(),
     approveAgentAction: approved => {
