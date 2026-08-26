@@ -4,6 +4,9 @@
 
 #include "chrome/browser/ui/views/side_panel/side_panel_helper.h"
 
+#include <memory>
+
+#include "base/functional/bind.h"
 #include "chrome/browser/history_clusters/history_clusters_service_factory.h"
 #include "chrome/browser/profiles/profile.h"
 #include "chrome/browser/ui/browser_actions.h"
@@ -22,11 +25,31 @@
 #include "components/history_clusters/core/features.h"
 #include "components/history_clusters/core/history_clusters_service.h"
 #include "ui/actions/actions.h"
+#include "ui/views/controls/webview/webview.h"
+#include "url/gurl.h"
+
+namespace {
+
+std::unique_ptr<views::View> CreateMewebAgentSidePanel(
+    Profile* profile,
+    SidePanelEntryScope& /*scope*/) {
+  auto web_view = std::make_unique<views::WebView>(profile);
+  web_view->LoadInitialURL(
+      GURL("chrome://new-tab-page/?mewebAgentSidePanel=1"));
+  return web_view;
+}
+
+}  // namespace
 
 // static
 void SidePanelHelper::PopulateGlobalEntries(
     BrowserWindowInterface* browser,
     SidePanelRegistry* window_registry) {
+  window_registry->Register(std::make_unique<SidePanelEntry>(
+      SidePanelEntry::Key(SidePanelEntry::Id::kAssistant),
+      base::BindRepeating(&CreateMewebAgentSidePanel, browser->GetProfile()),
+      base::BindRepeating([] { return 420; })));
+
   // Add reading list.
   ReadingListSidePanelCoordinator::From(browser)->CreateAndRegisterEntry(
       window_registry);

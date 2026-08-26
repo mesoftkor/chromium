@@ -243,6 +243,46 @@
     .audit-entry { padding:10px 12px; border-radius:8px; background:var(--surface-2); border:1px solid var(--line-soft); }
     .audit-entry time { display:block; color:var(--dim); font-size:.74em; }
     .audit-entry span { display:block; margin-top:3px; color:var(--muted); }
+    .agent-panel { width:100%; height:100%; display:flex; flex-direction:column; overflow:hidden; background:var(--bg); }
+    .agent-panel-head { flex:none; display:flex; align-items:center; gap:10px; min-height:55px; padding:10px 13px; border-bottom:1px solid var(--line-soft); background:var(--surface); }
+    .agent-panel-title { flex:1; min-width:0; }
+    .agent-panel-title b, .agent-panel-title small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .agent-panel-title b { font-size:.95em; }
+    .agent-panel-title small { color:var(--dim); font-size:.72em; }
+    .agent-live-dot { width:9px; height:9px; flex:none; border-radius:50%; background:var(--dim); }
+    .agent-live-dot.connected { background:var(--accent); box-shadow:0 0 0 4px var(--accent-soft); }
+    .agent-live-dot.running { background:var(--warn); box-shadow:0 0 0 4px #e8ab3f22; }
+    .agent-panel-body { flex:1; min-height:0; overflow:auto; padding:12px; }
+    .agent-target { margin-bottom:10px; padding:9px 10px; border:1px solid var(--line-soft); border-radius:9px; background:var(--surface); }
+    .agent-target-top { display:flex; align-items:center; gap:7px; }
+    .agent-target-top b { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.8em; }
+    .agent-target-url { display:block; margin-top:3px; color:var(--dim); font:.7em ui-monospace, SFMono-Regular, Menlo, monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .agent-messages { display:flex; flex-direction:column; gap:8px; }
+    .agent-message { max-width:94%; padding:9px 10px; border:1px solid var(--line-soft); border-radius:10px; background:var(--surface-2); }
+    .agent-message.user { align-self:flex-end; color:var(--fg); border-color:var(--accent); background:var(--accent-soft); }
+    .agent-message.system { max-width:100%; color:var(--muted); }
+    .agent-message.error { max-width:100%; color:var(--danger); border-color:#f0736a55; }
+    .agent-message small { display:block; margin-bottom:3px; color:var(--dim); font-size:.68em; }
+    .agent-message p { margin:0; white-space:pre-wrap; overflow-wrap:anywhere; font-size:.8em; }
+    .agent-plan { margin:10px 0; padding:10px; border:1px solid var(--line-soft); border-radius:9px; background:var(--surface); }
+    .agent-plan h3 { margin:0 0 7px; color:var(--dim); font-size:.7em; letter-spacing:.08em; text-transform:uppercase; }
+    .agent-plan-row { display:flex; gap:7px; padding:4px 0; color:var(--muted); font-size:.75em; }
+    .agent-plan-row .mark { color:var(--accent); }
+    .agent-approval { margin:10px 0; padding:11px; border:1px solid var(--warn); border-left-width:3px; border-radius:9px; background:#e8ab3f12; }
+    .agent-approval b { display:block; color:var(--warn); font-size:.8em; }
+    .agent-approval p { margin:4px 0 0; color:var(--muted); font-size:.76em; overflow-wrap:anywhere; }
+    .agent-approval .gate-actions { margin-top:9px; }
+    .agent-connect { margin:0 0 10px; padding:10px; border:1px solid var(--line-soft); border-radius:9px; background:var(--surface); }
+    .agent-connect p { margin:0 0 7px; color:var(--muted); font-size:.75em; }
+    .agent-connect-row { display:flex; gap:6px; }
+    .agent-connect-row input { min-width:0; flex:1; padding:7px 8px; border:1px solid var(--line); border-radius:7px; outline:0; background:var(--surface-2); }
+    .agent-composer { flex:none; padding:10px 12px 12px; border-top:1px solid var(--line-soft); background:var(--surface); }
+    .agent-composer textarea { width:100%; min-height:64px; max-height:150px; resize:vertical; padding:9px 10px; color:var(--fg); border:1px solid var(--line); border-radius:9px; outline:0; background:var(--surface-2); }
+    .agent-composer textarea:focus { border-color:var(--accent); }
+    .agent-composer-actions { display:flex; align-items:center; gap:7px; margin-top:7px; }
+    .agent-composer-actions .agent-status { flex:1; min-width:0; color:var(--dim); font-size:.7em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    body.agent-side-panel #mewebAgentWorkspace { display:none; }
+    body.agent-side-panel .agent-panel { display:flex !important; }
     .toast { position:fixed; z-index:50; bottom:26px; left:50%; transform:translate(-50%,18px); padding:10px 18px; opacity:0; pointer-events:none; color:var(--fg); border:1px solid var(--line); border-radius:9px; background:var(--surface-3); transition:.2s; }
     .toast.show { opacity:1; transform:translate(-50%,0); }
     @media (max-width:900px) {
@@ -286,6 +326,7 @@
     <div class="shell">
       <header class="topbar">
         <div class="crumb" id="crumb"><b>시작 화면</b> · 검색, 바로가기와 진행 중인 작업</div>
+        <button class="btn" id="agentButton">AI Agent</button>
         <button class="btn" id="auditButton" hidden>기록</button>
         <button class="btn primary" id="pauseButton" hidden>일시 정지</button>
       </header>
@@ -345,6 +386,33 @@
       <div class="audit-list" id="auditList"></div>
     </aside>
   </div>
+  <aside class="agent-panel" id="agentPanel" aria-label="MEWEB AI Agent" hidden>
+    <header class="agent-panel-head">
+      <span class="agent-live-dot" id="agentLiveDot"></span>
+      <div class="agent-panel-title"><b>MEWEB AI Agent</b><small id="agentModelLabel">모델 연결 확인 중</small></div>
+      <button class="icon-btn" id="agentRefreshButton" title="현재 탭 다시 관찰">↻</button>
+    </header>
+    <div class="agent-panel-body" id="agentPanelBody">
+      <section class="agent-target" aria-label="현재 제어 대상">
+        <div class="agent-target-top"><b id="agentTargetTitle">현재 탭을 확인하세요</b><span class="chip" id="agentTargetStatus">대기</span></div>
+        <span class="agent-target-url" id="agentTargetUrl">활성 웹 탭이 아직 관찰되지 않았습니다.</span>
+      </section>
+      <section class="agent-connect" id="agentConnectPanel" hidden>
+        <p id="agentConnectMessage">선택한 모델 공급자를 현재 앱 세션에 연결해야 합니다.</p>
+        <div class="agent-connect-row"><input id="agentCredentialInput" type="password" autocomplete="off" placeholder="API 키 또는 액세스 토큰"><button class="btn primary" id="agentConnectButton">연결</button></div>
+      </section>
+      <div class="agent-messages" id="agentMessages" aria-live="polite"></div>
+      <section class="agent-plan" id="agentPlan" hidden><h3>실행 계획</h3><div id="agentPlanRows"></div></section>
+      <section class="agent-approval" id="agentApproval" hidden>
+        <b>사용자 승인 필요</b><p id="agentApprovalSummary"></p>
+        <div class="gate-actions"><button class="btn primary" id="agentApproveButton">확인하고 승인</button><button class="btn" id="agentRejectButton">중단</button></div>
+      </section>
+    </div>
+    <footer class="agent-composer">
+      <textarea id="agentGoalInput" maxlength="65536" placeholder="현재 탭에서 할 일을 입력하세요. 예: 제목과 본문을 채우고 발행 직전에서 멈춰줘"></textarea>
+      <div class="agent-composer-actions"><span class="agent-status" id="agentStatus">대기 중</span><button class="btn danger" id="agentStopButton" hidden>중단</button><button class="btn primary" id="agentRunButton">실행</button></div>
+    </footer>
+  </aside>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <script type="module" src="new_tab_page.js"></script>
 </body>

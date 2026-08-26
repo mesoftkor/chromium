@@ -4,6 +4,7 @@
 
 #include "chrome/browser/ui/webui/new_tab_page/new_tab_page_ui.h"
 
+#include <algorithm>
 #include <initializer_list>
 #include <map>
 #include <memory>
@@ -30,10 +31,11 @@
 #include "base/strings/string_util.h"
 #include "base/strings/stringprintf.h"
 #include "base/strings/utf_string_conversions.h"
+#include "base/supports_user_data.h"
 #include "base/time/time.h"
 #include "base/values.h"
-#include "build/build_config.h"
 #include "build/branding_buildflags.h"
+#include "build/build_config.h"
 #include "chrome/browser/autocomplete/aim_eligibility_service_factory.h"
 #include "chrome/browser/browser_features.h"
 #include "chrome/browser/browser_process.h"
@@ -89,6 +91,7 @@
 #include "chrome/browser/user_education/user_education_service.h"
 #include "chrome/browser/user_education/user_education_service_factory.h"
 #include "chrome/common/channel_info.h"
+#include "chrome/common/chrome_isolated_world_ids.h"
 #include "chrome/common/pref_names.h"
 #include "chrome/common/search/instant_types.h"
 #include "chrome/common/url_constants.h"
@@ -128,6 +131,7 @@
 #include "components/user_education/common/ntp_promo/ntp_promo_controller.h"
 #include "components/user_education/common/user_education_features.h"
 #include "content/public/browser/navigation_handle.h"
+#include "content/public/browser/render_frame_host.h"
 #include "content/public/browser/url_data_source.h"
 #include "content/public/browser/web_ui.h"
 #include "content/public/browser/web_ui_data_source.h"
@@ -135,10 +139,11 @@
 #include "google_apis/gaia/core_account_id.h"
 #include "media/base/media_switches.h"
 #include "mojo/public/cpp/base/big_buffer.h"
+#include "mojo/public/cpp/bindings/callback_helpers.h"
 #include "net/base/net_errors.h"
 #include "net/base/url_util.h"
-#include "net/http/http_response_headers.h"
 #include "net/http/http_request_headers.h"
+#include "net/http/http_response_headers.h"
 #include "net/traffic_annotation/network_traffic_annotation.h"
 #include "services/network/public/cpp/resource_request.h"
 #include "services/network/public/cpp/shared_url_loader_factory.h"
@@ -163,7 +168,12 @@
 
 #if !BUILDFLAG(IS_ANDROID)
 #include "chrome/browser/ui/browser_window.h"
+#include "chrome/browser/ui/browser_window/public/browser_window_features.h"
+#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
+#include "chrome/browser/ui/side_panel/side_panel_entry.h"
+#include "chrome/browser/ui/side_panel/side_panel_ui.h"
 #include "chrome/browser/ui/tabs/public/tab_features.h"
+#include "chrome/browser/ui/tabs/tab_strip_model.h"
 #include "chrome/browser/ui/webui/new_tab_page/ntp_promo/ntp_promo_handler.h"
 #endif  // !BUILDFLAG(IS_ANDROID)
 
@@ -209,8 +219,7 @@ NewTabPageUIConfig::CreateWebUIController(content::WebUI* web_ui,
 namespace {
 
 constexpr char kPrevNavigationTimePrefName[] = "NewTabPage.PrevNavigationTime";
-constexpr char kMewebAgentWorkspaceStatePref[] =
-    "meweb.agent_workspace_state";
+constexpr char kMewebAgentWorkspaceStatePref[] = "meweb.agent_workspace_state";
 constexpr size_t kMaxMewebAgentWorkspaceStateBytes = 512 * 1024;
 constexpr size_t kMaxMewebModelAuthResponseBytes = 256 * 1024;
 constexpr size_t kMaxMewebModelInferenceResponseBytes = 1024 * 1024;
@@ -219,12 +228,35 @@ constexpr size_t kMaxMewebCredentialBytes = 16 * 1024;
 constexpr size_t kMaxMewebModelPromptBytes = 64 * 1024;
 constexpr size_t kMaxMewebModelToolsBytes = 64 * 1024;
 constexpr char kMewebModelTestOriginSwitch[] = "meweb-model-test-origin";
+constexpr char kMewebMemoryCredentialStoreKey[] =
+    "meweb.memory_model_credential_store";
 // The value for the "udm" (Unified Drilldown Mode) query parameter.
 // value "50" triggers AI mode as opposed to traditional search.
 constexpr char kAIMDisplayMode[] = "50";
 // The value for the "atvm" (AIM Threads Visibility Mode) query parameter.
 // value "3" corresponds to Threads Visibility Mode "Always Open".
 constexpr char kAIMThreadsVisibilityMode[] = "3";
+
+struct MewebMemoryCredential {
+  std::string value;
+  base::Time expires_at;
+};
+
+class MewebMemoryCredentialStore : public base::SupportsUserData::Data {
+ public:
+  std::map<std::string, MewebMemoryCredential> credentials;
+};
+
+MewebMemoryCredentialStore& GetMewebMemoryCredentialStore(Profile* profile) {
+  auto* store = static_cast<MewebMemoryCredentialStore*>(
+      profile->GetUserData(kMewebMemoryCredentialStoreKey));
+  if (!store) {
+    auto owned = std::make_unique<MewebMemoryCredentialStore>();
+    store = owned.get();
+    profile->SetUserData(kMewebMemoryCredentialStoreKey, std::move(owned));
+  }
+  return *store;
+}
 
 class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
  public:
@@ -264,19 +296,38 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
         "mewebModelCancel",
         base::BindRepeating(&MewebAgentWorkspaceHandler::HandleModelCancel,
                             base::Unretained(this)));
+    web_ui()->RegisterMessageCallback(
+        "mewebAgentShowSidePanel",
+        base::BindRepeating(
+            &MewebAgentWorkspaceHandler::HandleShowAgentSidePanel,
+            base::Unretained(this)));
+    web_ui()->RegisterMessageCallback(
+        "mewebAgentObserve",
+        base::BindRepeating(&MewebAgentWorkspaceHandler::HandleAgentObserve,
+                            base::Unretained(this)));
+    web_ui()->RegisterMessageCallback(
+        "mewebAgentExecute",
+        base::BindRepeating(&MewebAgentWorkspaceHandler::HandleAgentExecute,
+                            base::Unretained(this)));
   }
 
  private:
-  struct MemoryCredential {
-    std::string value;
-    base::Time expires_at;
-  };
-
   struct PendingInference {
     base::Value callback_id;
     std::string provider;
     std::string model;
   };
+
+  struct PendingObservation {
+    base::Value callback_id;
+    int sequence = 0;
+    int remaining = 0;
+    base::ListValue frames;
+  };
+
+  std::map<std::string, MewebMemoryCredential>& Credentials() {
+    return GetMewebMemoryCredentialStore(profile_).credentials;
+  }
 
   static std::string CredentialKey(std::string_view provider,
                                    std::string_view method) {
@@ -347,15 +398,24 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     return std::nullopt;
   }
 
-  static std::string CredentialEnvironmentVariable(
-      std::string_view provider,
-      std::string_view method) {
+  static std::string CredentialEnvironmentVariable(std::string_view provider,
+                                                   std::string_view method) {
     if (method == "api_key") {
-      if (provider == "openai") return "OPENAI_API_KEY";
-      if (provider == "anthropic") return "ANTHROPIC_API_KEY";
-      if (provider == "gemini") return "GEMINI_API_KEY";
-      if (provider == "ollama") return "OLLAMA_API_KEY";
-      if (provider == "openrouter") return "OPENROUTER_API_KEY";
+      if (provider == "openai") {
+        return "OPENAI_API_KEY";
+      }
+      if (provider == "anthropic") {
+        return "ANTHROPIC_API_KEY";
+      }
+      if (provider == "gemini") {
+        return "GEMINI_API_KEY";
+      }
+      if (provider == "ollama") {
+        return "OLLAMA_API_KEY";
+      }
+      if (provider == "openrouter") {
+        return "OPENROUTER_API_KEY";
+      }
     }
     if (provider == "anthropic" && method == "cli_oauth") {
       return "ANTHROPIC_OAUTH_TOKEN";
@@ -373,7 +433,9 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     if (auto test_origin = ModelTestOrigin()) {
       return test_origin->Resolve(base::StrCat({provider, "/models"}));
     }
-    if (provider == "openai") return GURL("https://api.openai.com/v1/models");
+    if (provider == "openai") {
+      return GURL("https://api.openai.com/v1/models");
+    }
     if (provider == "anthropic") {
       return GURL("https://api.anthropic.com/v1/models");
     }
@@ -399,7 +461,9 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     if (provider == "anthropic") {
       return GURL("https://api.anthropic.com/v1/messages");
     }
-    if (provider == "gemini") return endpoint;
+    if (provider == "gemini") {
+      return endpoint;
+    }
     if (provider == "openrouter") {
       return GURL("https://openrouter.ai/api/v1/chat/completions");
     }
@@ -444,23 +508,25 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
       return;
     }
     const std::string key = CredentialKey(provider, method);
-    auto credential = credentials_.find(key);
-    if (credential != credentials_.end() &&
+    auto& credentials = Credentials();
+    auto credential = credentials.find(key);
+    if (credential != credentials.end() &&
         (credential->second.expires_at.is_max() ||
          credential->second.expires_at > base::Time::Now())) {
       Reply(args[0], AuthResult(provider, method, true, "connected",
                                 "네이티브 메모리 브로커에 연결되어 있습니다."));
       return;
     }
-    if (credential != credentials_.end()) credentials_.erase(credential);
+    if (credential != credentials.end()) {
+      credentials.erase(credential);
+    }
     Reply(args[0], AuthResult(provider, method, false, "disconnected",
                               "현재 앱 세션에 연결된 자격 증명이 없습니다."));
   }
 
   void HandleModelAuthConnect(const base::ListValue& args) {
     if (args.size() != 5 || !args[0].is_string() || !args[1].is_string() ||
-        !args[2].is_string() || !args[3].is_string() ||
-        !args[4].is_string()) {
+        !args[2].is_string() || !args[3].is_string() || !args[4].is_string()) {
       return;
     }
     const std::string& provider = args[1].GetString();
@@ -494,8 +560,9 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     }
     if (method != "none" &&
         (credential.empty() || credential.size() > kMaxMewebCredentialBytes)) {
-      Reply(args[0], AuthResult(provider, method, false, "error",
-                                "자격 증명이 없거나 허용 크기를 초과했습니다."));
+      Reply(args[0],
+            AuthResult(provider, method, false, "error",
+                       "자격 증명이 없거나 허용 크기를 초과했습니다."));
       return;
     }
     BeginCredentialValidation(args[0].Clone(), provider, method,
@@ -509,7 +576,7 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     }
     const std::string& provider = args[1].GetString();
     const std::string& method = args[2].GetString();
-    credentials_.erase(CredentialKey(provider, method));
+    Credentials().erase(CredentialKey(provider, method));
     Reply(args[0], AuthResult(provider, method, false, "disconnected",
                               "현재 앱 세션의 연결을 해제했습니다."));
   }
@@ -517,7 +584,9 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
   static void AppendMessage(base::ListValue* messages,
                             std::string_view role,
                             std::string_view content) {
-    if (content.empty()) return;
+    if (content.empty()) {
+      return;
+    }
     base::DictValue message;
     message.Set("role", role);
     message.Set("content", content);
@@ -526,7 +595,9 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
 
   static std::string JsonString(const base::Value* value) {
     std::string serialized = "{}";
-    if (value) base::JSONWriter::Write(*value, &serialized);
+    if (value) {
+      base::JSONWriter::Write(*value, &serialized);
+    }
     return serialized;
   }
 
@@ -534,19 +605,24 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
                                     const base::ListValue& tools) {
     base::ListValue adapted;
     for (const auto& item : tools) {
-      if (!item.is_dict()) continue;
+      if (!item.is_dict()) {
+        continue;
+      }
       const auto& tool = item.GetDict();
       const std::string* name = tool.FindString("name");
-      if (!name || name->empty() || name->size() > 128) continue;
+      if (!name || name->empty() || name->size() > 128) {
+        continue;
+      }
       const std::string* description = tool.FindString("description");
       const base::Value* parameters = tool.Find("parameters");
       base::DictValue function;
       function.Set("name", *name);
-      if (description) function.Set("description", *description);
-      function.Set("parameters",
-                   parameters && parameters->is_dict()
-                       ? parameters->Clone()
-                       : base::Value(base::DictValue()));
+      if (description) {
+        function.Set("description", *description);
+      }
+      function.Set("parameters", parameters && parameters->is_dict()
+                                     ? parameters->Clone()
+                                     : base::Value(base::DictValue()));
       if (provider == "openai") {
         function.Set("type", "function");
         function.Set("strict", true);
@@ -554,12 +630,13 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
       } else if (provider == "anthropic") {
         base::DictValue anthropic_tool;
         anthropic_tool.Set("name", *name);
-        if (description) anthropic_tool.Set("description", *description);
-        anthropic_tool.Set(
-            "input_schema",
-            parameters && parameters->is_dict()
-                ? parameters->Clone()
-                : base::Value(base::DictValue()));
+        if (description) {
+          anthropic_tool.Set("description", *description);
+        }
+        anthropic_tool.Set("input_schema",
+                           parameters && parameters->is_dict()
+                               ? parameters->Clone()
+                               : base::Value(base::DictValue()));
         adapted.Append(std::move(anthropic_tool));
       } else {
         base::DictValue wrapper;
@@ -584,7 +661,9 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     payload.Set("model", model);
     if (provider == "openai") {
       payload.Set("input", prompt);
-      if (!instructions.empty()) payload.Set("instructions", instructions);
+      if (!instructions.empty()) {
+        payload.Set("instructions", instructions);
+      }
       payload.Set("max_output_tokens", max_output_tokens);
       payload.Set("temperature", temperature);
       payload.Set("store", false);
@@ -599,7 +678,9 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
       base::ListValue messages;
       AppendMessage(&messages, "user", prompt);
       payload.Set("messages", std::move(messages));
-      if (!instructions.empty()) payload.Set("system", instructions);
+      if (!instructions.empty()) {
+        payload.Set("system", instructions);
+      }
       payload.Set("max_tokens", max_output_tokens);
       payload.Set("temperature", temperature);
       auto adapted = AdaptTools(provider, tools);
@@ -639,14 +720,17 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
       if (!tools.empty()) {
         base::ListValue declarations;
         for (const auto& item : tools) {
-          if (!item.is_dict()) continue;
+          if (!item.is_dict()) {
+            continue;
+          }
           const auto& tool = item.GetDict();
           const std::string* name = tool.FindString("name");
-          if (!name || name->empty()) continue;
+          if (!name || name->empty()) {
+            continue;
+          }
           base::DictValue declaration;
           declaration.Set("name", *name);
-          if (const std::string* description =
-                  tool.FindString("description")) {
+          if (const std::string* description = tool.FindString("description")) {
             declaration.Set("description", *description);
           }
           const base::Value* parameters = tool.Find("parameters");
@@ -663,9 +747,9 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
           gemini_tools.Append(std::move(functions));
           payload.Set("tools", std::move(gemini_tools));
           base::DictValue function_calling;
-          function_calling.Set(
-              "mode", tool_choice == "required" ? "ANY" :
-                      tool_choice == "none" ? "NONE" : "AUTO");
+          function_calling.Set("mode", tool_choice == "required" ? "ANY"
+                                       : tool_choice == "none"   ? "NONE"
+                                                                 : "AUTO");
           base::DictValue tool_config;
           tool_config.Set("functionCallingConfig", std::move(function_calling));
           payload.Set("toolConfig", std::move(tool_config));
@@ -691,7 +775,9 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
       auto adapted = AdaptTools(provider, tools);
       if (!adapted.empty()) {
         payload.Set("tools", std::move(adapted));
-        if (provider == "openrouter") payload.Set("tool_choice", tool_choice);
+        if (provider == "openrouter") {
+          payload.Set("tool_choice", tool_choice);
+        }
       }
       return payload;
     }
@@ -722,13 +808,11 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
   }
 
   void HandleModelGenerate(const base::ListValue& args) {
-    if (args.size() != 11 || !args[0].is_string() ||
-        !args[1].is_string() || !args[2].is_string() ||
-        !args[3].is_string() || !args[4].is_string() ||
-        !args[5].is_string() || !args[6].is_string() ||
-        !args[7].is_int() ||
-        (!args[8].is_double() && !args[8].is_int()) ||
-        !args[9].is_string() || !args[10].is_string()) {
+    if (args.size() != 11 || !args[0].is_string() || !args[1].is_string() ||
+        !args[2].is_string() || !args[3].is_string() || !args[4].is_string() ||
+        !args[5].is_string() || !args[6].is_string() || !args[7].is_int() ||
+        (!args[8].is_double() && !args[8].is_int()) || !args[9].is_string() ||
+        !args[10].is_string()) {
       return;
     }
     const std::string& provider = args[1].GetString();
@@ -738,8 +822,8 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     const std::string& instructions = args[5].GetString();
     const std::string& prompt = args[6].GetString();
     const int max_output_tokens = args[7].GetInt();
-    const double temperature = args[8].is_double() ?
-        args[8].GetDouble() : args[8].GetInt();
+    const double temperature =
+        args[8].is_double() ? args[8].GetDouble() : args[8].GetInt();
     const std::string& tool_choice = args[9].GetString();
     const std::string& tools_json = args[10].GetString();
     auto error = [&](std::string_view message) {
@@ -766,11 +850,14 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
       return;
     }
     const std::string credential_key = CredentialKey(provider, method);
-    auto credential = credentials_.find(credential_key);
-    if (credential == credentials_.end() ||
+    auto& credentials = Credentials();
+    auto credential = credentials.find(credential_key);
+    if (credential == credentials.end() ||
         (!credential->second.expires_at.is_max() &&
          credential->second.expires_at <= base::Time::Now())) {
-      if (credential != credentials_.end()) credentials_.erase(credential);
+      if (credential != credentials.end()) {
+        credentials.erase(credential);
+      }
       error("먼저 현재 모델 공급자 연결을 완료하세요.");
       return;
     }
@@ -779,9 +866,9 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
       error("도구 정의가 JSON 배열이 아닙니다.");
       return;
     }
-    auto payload = BuildInferencePayload(
-        provider, model, instructions, prompt, max_output_tokens, temperature,
-        tool_choice, parsed_tools->GetList());
+    auto payload = BuildInferencePayload(provider, model, instructions, prompt,
+                                         max_output_tokens, temperature,
+                                         tool_choice, parsed_tools->GetList());
     if (!payload) {
       error("지원하지 않는 모델 공급자입니다.");
       return;
@@ -814,9 +901,11 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
   }
 
   void HandleModelCancel(const base::ListValue& args) {
-    if (args.size() != 1 || !args[0].is_string()) return;
-    auto result = InferenceResult("", "", "idle",
-                                  "실행 중인 모델 요청이 없습니다.");
+    if (args.size() != 1 || !args[0].is_string()) {
+      return;
+    }
+    auto result =
+        InferenceResult("", "", "idle", "실행 중인 모델 요청이 없습니다.");
     if (pending_inference_) {
       PendingInference cancelled = std::move(*pending_inference_);
       pending_inference_.reset();
@@ -824,10 +913,341 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
       Reply(cancelled.callback_id,
             InferenceResult(cancelled.provider, cancelled.model, "cancelled",
                             "사용자가 모델 요청을 취소했습니다."));
-      result = InferenceResult(cancelled.provider, cancelled.model,
-                               "cancelled", "모델 요청을 취소했습니다.");
+      result = InferenceResult(cancelled.provider, cancelled.model, "cancelled",
+                               "모델 요청을 취소했습니다.");
     }
     Reply(args[0], std::move(result));
+  }
+
+  static base::DictValue AgentResult(bool ok,
+                                     std::string_view status,
+                                     std::string_view message) {
+    base::DictValue result;
+    result.Set("ok", ok);
+    result.Set("status", status);
+    result.Set("message", message);
+    return result;
+  }
+
+  WebContents* AgentTarget() const {
+#if BUILDFLAG(IS_ANDROID)
+    return nullptr;
+#else
+    auto* collection = ProfileBrowserCollection::GetForProfile(profile_);
+    auto* browser = collection ? collection->FindTabbedBrowser() : nullptr;
+    return browser && browser->GetTabStripModel()
+               ? browser->GetTabStripModel()->GetActiveWebContents()
+               : nullptr;
+#endif
+  }
+
+  void HandleShowAgentSidePanel(const base::ListValue& args) {
+#if !BUILDFLAG(IS_ANDROID)
+    auto* collection = ProfileBrowserCollection::GetForProfile(profile_);
+    auto* browser = collection ? collection->FindTabbedBrowser() : nullptr;
+    auto* side_panel =
+        browser ? browser->GetFeatures().side_panel_ui() : nullptr;
+    if (side_panel) {
+      side_panel->Show(SidePanelEntry::Id::kAssistant,
+                       SidePanelOpenTrigger::kToolbarButton);
+    }
+#endif
+  }
+
+  static bool IsAllowedAgentUrl(const GURL& url) {
+    if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS() || url.has_username() ||
+        url.has_password()) {
+      return false;
+    }
+    return IsLoopbackHost(url.host()) || url.host() == "blog.naver.com" ||
+           url.host() == "m.blog.naver.com";
+  }
+
+  static std::vector<content::RenderFrameHost*> AgentFrames(
+      WebContents* target) {
+    std::vector<content::RenderFrameHost*> frames;
+    if (!target) {
+      return frames;
+    }
+    auto* main_frame = target->GetPrimaryMainFrame();
+    if (!main_frame) {
+      return frames;
+    }
+    main_frame->ForEachRenderFrameHost(
+        [&frames](content::RenderFrameHost* frame) {
+          if (frame && frame->IsRenderFrameLive()) {
+            frames.push_back(frame);
+          }
+        });
+    return frames;
+  }
+
+  void HandleAgentObserve(const base::ListValue& args) {
+    if (args.size() != 1 || !args[0].is_string()) {
+      return;
+    }
+    if (pending_observation_) {
+      PendingObservation stale = std::move(*pending_observation_);
+      pending_observation_.reset();
+      Reply(stale.callback_id,
+            AgentResult(false, "stale_observation",
+                        "탭이 변경되어 이전 페이지 관찰을 취소했습니다."));
+    }
+    WebContents* target = AgentTarget();
+    if (!target || !target->GetPrimaryMainFrame()) {
+      Reply(args[0],
+            AgentResult(false, "no_target", "제어할 활성 웹 탭이 없습니다."));
+      return;
+    }
+    std::vector<content::RenderFrameHost*> frames = AgentFrames(target);
+    if (frames.empty()) {
+      Reply(args[0], AgentResult(false, "no_target",
+                                 "관찰할 수 있는 웹 프레임이 없습니다."));
+      return;
+    }
+    const int sequence = ++observation_sequence_;
+    pending_observation_ =
+        PendingObservation{args[0].Clone(), sequence,
+                           static_cast<int>(frames.size()), base::ListValue()};
+    static constexpr char kObserveScript[] = R"JS(
+      (() => {
+        const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+        const bodyText = clean(document.body?.innerText).slice(0, 12000);
+        let counter = Number(globalThis.__mewebAgentRefCounter || 0);
+        const nodes = Array.from(document.querySelectorAll(
+            'a[href],button,input:not([type="hidden"]),textarea,select,' +
+            '[contenteditable="true"],[role="button"],[tabindex]')).slice(0, 100);
+        const elements = nodes.map(node => {
+          let ref = node.getAttribute('data-meweb-agent-ref');
+          if (!ref) {
+            ref = `mew-${++counter}`;
+            node.setAttribute('data-meweb-agent-ref', ref);
+          }
+          const type = clean(node.getAttribute('type')).toLowerCase();
+          const sensitive = ['password', 'email', 'tel'].includes(type);
+          return {
+            ref,
+            tag: node.tagName.toLowerCase(),
+            role: clean(node.getAttribute('role')),
+            type,
+            name: clean(node.getAttribute('name')),
+            label: clean(node.getAttribute('aria-label') ||
+                         node.getAttribute('title') || node.innerText ||
+                         node.getAttribute('placeholder')).slice(0, 240),
+            value: sensitive ? '[보호됨]' : clean(node.value).slice(0, 500),
+            disabled: Boolean(node.disabled ||
+                              node.getAttribute('aria-disabled') === 'true')
+          };
+        });
+        globalThis.__mewebAgentRefCounter = counter;
+        const injectionPattern =
+            /(ignore (all |the )?(previous|above) instructions|system\s*:|developer\s*:|도구 호출을 강제|이전 지시를 무시)/i;
+        return {
+          ok: true,
+          status: injectionPattern.test(bodyText) ? 'prompt_injection' : 'observed',
+          url: location.href,
+          title: document.title,
+          text: bodyText,
+          elements
+        };
+      })()
+    )JS";
+    for (size_t index = 0; index < frames.size(); ++index) {
+      frames[index]->ExecuteJavaScriptInIsolatedWorld(
+          base::UTF8ToUTF16(std::string_view(kObserveScript)),
+          mojo::WrapCallbackWithDefaultInvokeIfNotRun(
+              base::BindOnce(&MewebAgentWorkspaceHandler::OnAgentFrameObserved,
+                             weak_ptr_factory_.GetWeakPtr(), sequence,
+                             static_cast<int>(index),
+                             frames[index]->GetLastCommittedURL()),
+              base::Value()),
+          ISOLATED_WORLD_ID_CHROME_INTERNAL);
+    }
+  }
+
+  void OnAgentFrameObserved(int sequence,
+                            int frame_index,
+                            GURL frame_url,
+                            base::Value value) {
+    if (!pending_observation_ || pending_observation_->sequence != sequence) {
+      return;
+    }
+    if (value.is_dict()) {
+      base::DictValue frame = std::move(value).TakeDict();
+      frame.Set("frame_index", frame_index);
+      frame.Set("frame_url", frame_url.spec());
+      pending_observation_->frames.Append(std::move(frame));
+    }
+    if (--pending_observation_->remaining > 0) {
+      return;
+    }
+    PendingObservation pending = std::move(*pending_observation_);
+    pending_observation_.reset();
+    auto result =
+        AgentResult(true, "observed", "활성 탭의 DOM을 관찰했습니다.");
+    bool injection = false;
+    for (const auto& frame : pending.frames) {
+      if (frame.is_dict()) {
+        const std::string* status = frame.GetDict().FindString("status");
+        if (status && *status == "prompt_injection") {
+          injection = true;
+        }
+      }
+    }
+    if (injection) {
+      result.Set("status", "prompt_injection");
+      result.Set(
+          "message",
+          "페이지에서 프롬프트 인젝션으로 의심되는 문구를 감지했습니다.");
+    }
+    result.Set("frames", std::move(pending.frames));
+    Reply(pending.callback_id, std::move(result));
+  }
+
+  void HandleAgentExecute(const base::ListValue& args) {
+    if (args.size() != 4 || !args[0].is_string() || !args[1].is_string() ||
+        !args[2].is_string() || !args[3].is_bool()) {
+      return;
+    }
+    const std::string& tool = args[1].GetString();
+    auto parsed = base::JSONReader::Read(args[2].GetString(), 0);
+    if (!parsed || !parsed->is_dict()) {
+      Reply(args[0], AgentResult(false, "invalid_arguments",
+                                 "도구 인수가 JSON 객체가 아닙니다."));
+      return;
+    }
+    const auto& arguments = parsed->GetDict();
+    const bool approved = args[3].GetBool();
+    if (tool == "navigate") {
+      const std::string* value = arguments.FindString("url");
+      const GURL url(value ? *value : std::string());
+      if (!url.is_valid() || !url.SchemeIsHTTPOrHTTPS() || url.has_username() ||
+          url.has_password()) {
+        Reply(args[0], AgentResult(false, "blocked",
+                                   "HTTP 또는 HTTPS 주소만 열 수 있습니다."));
+        return;
+      }
+      if (!IsAllowedAgentUrl(url) && !approved) {
+        auto result = AgentResult(
+            false, "approval_required",
+            "허용 목록 밖의 사이트로 이동하려면 승인이 필요합니다.");
+        result.Set("risk", "external_navigation");
+        result.Set("summary", url.DeprecatedGetOriginAsURL().spec());
+        Reply(args[0], std::move(result));
+        return;
+      }
+#if BUILDFLAG(IS_ANDROID)
+      Reply(args[0],
+            AgentResult(false, "unsupported",
+                        "현재 플랫폼에서 탭 이동을 지원하지 않습니다."));
+#else
+      auto* collection = ProfileBrowserCollection::GetForProfile(profile_);
+      auto* browser = collection ? collection->FindTabbedBrowser() : nullptr;
+      if (!browser) {
+        Reply(args[0], AgentResult(false, "no_target",
+                                   "제어할 브라우저 창이 없습니다."));
+        return;
+      }
+      browser->OpenGURL(url, WindowOpenDisposition::CURRENT_TAB);
+      auto result = AgentResult(true, "executed", "활성 탭을 이동했습니다.");
+      result.Set("url", url.spec());
+      Reply(args[0], std::move(result));
+#endif
+      return;
+    }
+
+    if (tool != "click" && tool != "type" && tool != "scroll") {
+      Reply(args[0], AgentResult(false, "unsupported_tool",
+                                 "지원하지 않는 브라우저 도구입니다."));
+      return;
+    }
+    WebContents* target = AgentTarget();
+    if (!target) {
+      Reply(args[0],
+            AgentResult(false, "no_target", "제어할 활성 웹 탭이 없습니다."));
+      return;
+    }
+    int frame_index = arguments.FindInt("frame_index").value_or(0);
+    std::vector<content::RenderFrameHost*> frames = AgentFrames(target);
+    if (frame_index < 0 || frame_index >= static_cast<int>(frames.size()) ||
+        !frames[frame_index] || !frames[frame_index]->IsRenderFrameLive()) {
+      Reply(args[0],
+            AgentResult(false, "stale_observation",
+                        "관찰한 프레임이 변경되었습니다. 다시 관찰하세요."));
+      return;
+    }
+    std::string serialized_arguments;
+    base::JSONWriter::Write(*parsed, &serialized_arguments);
+    const std::string script = base::StrCat({R"JS(
+      (() => {
+        const args = )JS",
+                                             serialized_arguments, R"JS(;
+        const approved = )JS",
+                                             approved ? "true" : "false", R"JS(;
+        const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+        if (')JS",
+                                             tool, R"JS(' === 'scroll') {
+          const x = Math.max(-2000, Math.min(2000, Number(args.x || 0)));
+          const y = Math.max(-2000, Math.min(2000, Number(args.y || 0)));
+          window.scrollBy({left: x, top: y, behavior: 'instant'});
+          return {ok: true, status: 'executed', message: '페이지를 스크롤했습니다.'};
+        }
+        const ref = clean(args.ref);
+        if (!/^mew-[0-9]+$/.test(ref)) {
+          return {ok: false, status: 'invalid_arguments', message: 'DOM 참조값이 올바르지 않습니다.'};
+        }
+        const node = document.querySelector(`[data-meweb-agent-ref="${ref}"]`);
+        if (!node || !node.isConnected) {
+          return {ok: false, status: 'stale_observation', message: '대상 요소가 변경되었습니다. 다시 관찰하세요.'};
+        }
+        if (')JS",
+                                             tool, R"JS(' === 'type') {
+          const text = String(args.text || '').slice(0, 20000);
+          node.focus();
+          if (node.isContentEditable) {
+            node.textContent = text;
+            node.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: text}));
+          } else if ('value' in node) {
+            const descriptor = Object.getOwnPropertyDescriptor(
+                node.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype,
+                'value');
+            if (descriptor?.set) descriptor.set.call(node, text); else node.value = text;
+            node.dispatchEvent(new Event('input', {bubbles: true}));
+            node.dispatchEvent(new Event('change', {bubbles: true}));
+          } else {
+            return {ok: false, status: 'blocked', message: '문자를 입력할 수 없는 요소입니다.'};
+          }
+          return {ok: true, status: 'executed', message: '요청한 문자를 입력했습니다.', ref};
+        }
+        const label = clean(node.getAttribute('aria-label') || node.title || node.innerText || node.value);
+        if (/(발행|게시|publish|예약\s*발행|임시\s*저장)/i.test(label)) {
+          return {ok: false, status: 'publish_blocked', message: '발행·게시·임시저장 동작은 에이전트가 실행할 수 없습니다.', summary: label};
+        }
+        if (/(보내기|전송|구매|결제|삭제|탈퇴|send|purchase|pay|delete)/i.test(label) && !approved) {
+          return {ok: false, status: 'approval_required', risk: 'external_effect', message: '외부 영향을 남기는 클릭은 승인이 필요합니다.', summary: label};
+        }
+        node.scrollIntoView({block: 'center', inline: 'center'});
+        node.click();
+        return {ok: true, status: 'executed', message: '요소를 클릭했습니다.', ref, summary: label};
+      })()
+    )JS"});
+    frames[frame_index]->ExecuteJavaScriptInIsolatedWorld(
+        base::UTF8ToUTF16(script),
+        mojo::WrapCallbackWithDefaultInvokeIfNotRun(
+            base::BindOnce(&MewebAgentWorkspaceHandler::OnAgentActionExecuted,
+                           weak_ptr_factory_.GetWeakPtr(), args[0].Clone()),
+            base::Value()),
+        ISOLATED_WORLD_ID_CHROME_INTERNAL);
+  }
+
+  void OnAgentActionExecuted(base::Value callback_id, base::Value value) {
+    if (!value.is_dict()) {
+      Reply(callback_id,
+            AgentResult(false, "execution_failed",
+                        "브라우저 도구가 결과를 반환하지 못했습니다."));
+      return;
+    }
+    Reply(callback_id, std::move(value).TakeDict());
   }
 
   void BeginCredentialValidation(base::Value callback_id,
@@ -867,19 +1287,19 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
                              bool success,
                              std::optional<std::string> body) {
     if (!success) {
-      Reply(callback_id,
-            AuthResult(provider, method, false, "error",
-                       "공급자 연결 검증에 실패했습니다. 주소와 자격 증명을 확인하세요."));
+      Reply(callback_id, AuthResult(provider, method, false, "error",
+                                    "공급자 연결 검증에 실패했습니다. 주소와 "
+                                    "자격 증명을 확인하세요."));
       return;
     }
-    credentials_.insert_or_assign(
+    Credentials().insert_or_assign(
         CredentialKey(provider, method),
-        MemoryCredential{std::move(credential), base::Time::Max()});
+        MewebMemoryCredential{std::move(credential), base::Time::Max()});
     Reply(callback_id,
           AuthResult(provider, method, true, "connected",
-                     provider == "ollama" ?
-                         "Ollama API 연결과 버전 응답을 확인했습니다." :
-                         "공급자 API 연결과 자격 증명을 확인했습니다."));
+                     provider == "ollama"
+                         ? "Ollama API 연결과 버전 응답을 확인했습니다."
+                         : "공급자 API 연결과 자격 증명을 확인했습니다."));
   }
 
   bool ReadIdentityToken(const std::string& path_value,
@@ -899,8 +1319,9 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
       return false;
     }
 #endif
-    if (!base::ReadFileToStringWithMaxSize(
-            path, token, kMaxMewebIdentityTokenBytes) || token->empty()) {
+    if (!base::ReadFileToStringWithMaxSize(path, token,
+                                           kMaxMewebIdentityTokenBytes) ||
+        token->empty()) {
       *error = "ID 토큰 파일을 안전하게 읽을 수 없습니다.";
       return false;
     }
@@ -915,7 +1336,9 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     auto required = [&](std::string_view name, std::string* output) {
       const std::string variable_name(name);
       auto value = environment->GetVar(variable_name);
-      if (!value || value->empty()) return false;
+      if (!value || value->empty()) {
+        return false;
+      }
       *output = std::move(*value);
       return true;
     };
@@ -938,8 +1361,7 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
       }
       payload.Set("grant_type",
                   "urn:ietf:params:oauth:grant-type:token-exchange");
-      payload.Set("subject_token_type",
-                  "urn:ietf:params:oauth:token-type:jwt");
+      payload.Set("subject_token_type", "urn:ietf:params:oauth:token-type:jwt");
       payload.Set("identity_provider_id", first_id);
       payload.Set("service_account_id", service_account_id);
       token_endpoint = GURL("https://auth.openai.com/oauth/token");
@@ -953,8 +1375,7 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
                          "Anthropic WIF 환경 설정 4개가 필요합니다."));
         return;
       }
-      payload.Set("grant_type",
-                  "urn:ietf:params:oauth:grant-type:jwt-bearer");
+      payload.Set("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer");
       payload.Set("federation_rule_id", first_id);
       payload.Set("organization_id", organization_id);
       payload.Set("service_account_id", service_account_id);
@@ -967,9 +1388,8 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     }
     std::string read_error;
     if (!ReadIdentityToken(token_path, &subject_token, &read_error)) {
-      Reply(callback_id,
-            AuthResult(provider, method, false, "invalid_token_file",
-                       read_error));
+      Reply(callback_id, AuthResult(provider, method, false,
+                                    "invalid_token_file", read_error));
       return;
     }
     payload.Set(provider == "openai" ? "subject_token" : "assertion",
@@ -1014,22 +1434,24 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
         parsed->GetDict().FindInt("expires_in");
     if (!access_token || access_token->empty() || !expires_in ||
         *expires_in <= 0 || *expires_in > 3600) {
-      Reply(callback_id, AuthResult(provider, method, false, "error",
-                                    "WIF 응답의 토큰 만료값이 올바르지 않습니다."));
+      Reply(callback_id,
+            AuthResult(provider, method, false, "error",
+                       "WIF 응답의 토큰 만료값이 올바르지 않습니다."));
       return;
     }
-    credentials_.insert_or_assign(
+    Credentials().insert_or_assign(
         CredentialKey(provider, method),
-        MemoryCredential{*access_token,
-                         base::Time::Now() + base::Seconds(*expires_in)});
+        MewebMemoryCredential{*access_token,
+                              base::Time::Now() + base::Seconds(*expires_in)});
     auto result = AuthResult(provider, method, true, "connected",
                              "단기 WIF 토큰을 메모리에 연결했습니다.");
     result.Set("expires_in", *expires_in);
     Reply(callback_id, std::move(result));
   }
 
-  using RequestCallback = base::OnceCallback<void(
-      bool success, std::optional<std::string> response_body)>;
+  using RequestCallback =
+      base::OnceCallback<void(bool success,
+                              std::optional<std::string> response_body)>;
 
   void StartRequest(std::unique_ptr<network::ResourceRequest> request,
                     std::string upload_body,
@@ -1055,8 +1477,8 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
             policy_exception_justification:
               "This is a user-selected model provider connection."
           })");
-    auth_loader_ =
-        network::SimpleURLLoader::Create(std::move(request), traffic_annotation);
+    auth_loader_ = network::SimpleURLLoader::Create(std::move(request),
+                                                    traffic_annotation);
     if (!upload_body.empty()) {
       auth_loader_->AttachStringForUpload(std::move(upload_body),
                                           "application/json");
@@ -1070,21 +1492,23 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
 
   void OnRequestFinished(RequestCallback callback,
                          std::optional<std::string> body) {
-    bool success = auth_loader_ && auth_loader_->NetError() == net::OK &&
-                   auth_loader_->ResponseInfo() &&
-                   auth_loader_->ResponseInfo()->headers &&
-                   auth_loader_->ResponseInfo()->headers->response_code() >=
-                       200 &&
-                   auth_loader_->ResponseInfo()->headers->response_code() <=
-                       299 &&
-                   body.has_value();
+    bool success =
+        auth_loader_ && auth_loader_->NetError() == net::OK &&
+        auth_loader_->ResponseInfo() && auth_loader_->ResponseInfo()->headers &&
+        auth_loader_->ResponseInfo()->headers->response_code() >= 200 &&
+        auth_loader_->ResponseInfo()->headers->response_code() <= 299 &&
+        body.has_value();
     auth_loader_.reset();
     std::move(callback).Run(success, std::move(body));
   }
 
   static void AppendText(std::string* output, std::string_view text) {
-    if (text.empty()) return;
-    if (!output->empty()) output->append("\n");
+    if (text.empty()) {
+      return;
+    }
+    if (!output->empty()) {
+      output->append("\n");
+    }
     output->append(text);
   }
 
@@ -1096,7 +1520,9 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
                              std::string_view id,
                              std::string_view name,
                              const base::Value* arguments) {
-    if (name.empty()) return;
+    if (name.empty()) {
+      return;
+    }
     base::DictValue call;
     call.Set("id", id);
     call.Set("name", name);
@@ -1106,9 +1532,13 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
 
   static int UsageInt(const base::DictValue* usage,
                       std::initializer_list<std::string_view> names) {
-    if (!usage) return 0;
+    if (!usage) {
+      return 0;
+    }
     for (std::string_view name : names) {
-      if (auto value = usage->FindInt(name)) return *value;
+      if (auto value = usage->FindInt(name)) {
+        return *value;
+      }
     }
     return 0;
   }
@@ -1118,7 +1548,9 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
       std::string_view model,
       std::string_view body) const {
     auto parsed = base::JSONReader::Read(body, 0);
-    if (!parsed || !parsed->is_dict()) return std::nullopt;
+    if (!parsed || !parsed->is_dict()) {
+      return std::nullopt;
+    }
     const auto& root = parsed->GetDict();
     std::string text;
     std::string finish_reason;
@@ -1130,13 +1562,17 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     if (provider == "openai") {
       if (const auto* output = root.FindList("output")) {
         for (const auto& item_value : *output) {
-          if (!item_value.is_dict()) continue;
+          if (!item_value.is_dict()) {
+            continue;
+          }
           const auto& item = item_value.GetDict();
           const std::string* type = item.FindString("type");
           if (type && *type == "message") {
             if (const auto* content = item.FindList("content")) {
               for (const auto& part_value : *content) {
-                if (!part_value.is_dict()) continue;
+                if (!part_value.is_dict()) {
+                  continue;
+                }
                 const auto& part = part_value.GetDict();
                 if (part.FindString("type") &&
                     *part.FindString("type") == "output_text") {
@@ -1147,12 +1583,11 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
               }
             }
           } else if (type && *type == "function_call") {
-            AppendToolCall(&tool_calls,
-                           item.FindString("call_id") ?
-                               *item.FindString("call_id") : "",
-                           item.FindString("name") ?
-                               *item.FindString("name") : "",
-                           item.Find("arguments"));
+            AppendToolCall(
+                &tool_calls,
+                item.FindString("call_id") ? *item.FindString("call_id") : "",
+                item.FindString("name") ? *item.FindString("name") : "",
+                item.Find("arguments"));
           }
         }
       }
@@ -1166,7 +1601,9 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     } else if (provider == "anthropic") {
       if (const auto* content = root.FindList("content")) {
         for (const auto& part_value : *content) {
-          if (!part_value.is_dict()) continue;
+          if (!part_value.is_dict()) {
+            continue;
+          }
           const auto& part = part_value.GetDict();
           const std::string* type = part.FindString("type");
           if (type && *type == "text") {
@@ -1174,11 +1611,11 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
               AppendText(&text, *value);
             }
           } else if (type && *type == "tool_use") {
-            AppendToolCall(&tool_calls,
-                           part.FindString("id") ? *part.FindString("id") : "",
-                           part.FindString("name") ?
-                               *part.FindString("name") : "",
-                           part.Find("input"));
+            AppendToolCall(
+                &tool_calls,
+                part.FindString("id") ? *part.FindString("id") : "",
+                part.FindString("name") ? *part.FindString("name") : "",
+                part.Find("input"));
           }
         }
       }
@@ -1199,16 +1636,18 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
         if (const auto* content = candidate.FindDict("content")) {
           if (const auto* parts = content->FindList("parts")) {
             for (const auto& part_value : *parts) {
-              if (!part_value.is_dict()) continue;
+              if (!part_value.is_dict()) {
+                continue;
+              }
               const auto& part = part_value.GetDict();
               if (const std::string* value = part.FindString("text")) {
                 AppendText(&text, *value);
               }
               if (const auto* call = part.FindDict("functionCall")) {
-                AppendToolCall(&tool_calls, "",
-                               call->FindString("name") ?
-                                   *call->FindString("name") : "",
-                               call->Find("args"));
+                AppendToolCall(
+                    &tool_calls, "",
+                    call->FindString("name") ? *call->FindString("name") : "",
+                    call->Find("args"));
               }
             }
           }
@@ -1250,15 +1689,19 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
         }
         if (const auto* calls = message->FindList("tool_calls")) {
           for (const auto& call_value : *calls) {
-            if (!call_value.is_dict()) continue;
+            if (!call_value.is_dict()) {
+              continue;
+            }
             const auto& call = call_value.GetDict();
             const auto* function = call.FindDict("function");
-            if (!function) continue;
+            if (!function) {
+              continue;
+            }
             AppendToolCall(&tool_calls,
-                           call.FindString("id") ?
-                               *call.FindString("id") : "",
-                           function->FindString("name") ?
-                               *function->FindString("name") : "",
+                           call.FindString("id") ? *call.FindString("id") : "",
+                           function->FindString("name")
+                               ? *function->FindString("name")
+                               : "",
                            function->Find("arguments"));
           }
         }
@@ -1275,8 +1718,8 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     base::DictValue usage;
     usage.Set("input_tokens", input_tokens);
     usage.Set("output_tokens", output_tokens);
-    usage.Set("total_tokens", total_tokens > 0 ? total_tokens :
-                                                input_tokens + output_tokens);
+    usage.Set("total_tokens",
+              total_tokens > 0 ? total_tokens : input_tokens + output_tokens);
     result.Set("usage", std::move(usage));
     return result;
   }
@@ -1306,10 +1749,10 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
               "This is a user-requested connection to a selected AI provider."
           })");
     pending_inference_ = std::move(pending);
-    inference_loader_ =
-        network::SimpleURLLoader::Create(std::move(request), traffic_annotation);
+    inference_loader_ = network::SimpleURLLoader::Create(std::move(request),
+                                                         traffic_annotation);
     inference_loader_->AttachStringForUpload(std::move(upload_body),
-                                              "application/json");
+                                             "application/json");
     inference_loader_->DownloadToString(
         profile_->GetURLLoaderFactory().get(),
         base::BindOnce(&MewebAgentWorkspaceHandler::OnInferenceFinished,
@@ -1318,7 +1761,9 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
   }
 
   void OnInferenceFinished(std::optional<std::string> body) {
-    if (!pending_inference_) return;
+    if (!pending_inference_) {
+      return;
+    }
     PendingInference pending = std::move(*pending_inference_);
     pending_inference_.reset();
     const int network_error =
@@ -1331,16 +1776,17 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
     inference_loader_.reset();
     if (network_error != net::OK || http_status < 200 || http_status > 299 ||
         !body) {
-      auto result = InferenceResult(
-          pending.provider, pending.model, "error",
-          network_error == net::OK ?
-              "모델 공급자가 요청을 거부했습니다." :
-              "모델 공급자 네트워크 요청에 실패했습니다.");
+      auto result =
+          InferenceResult(pending.provider, pending.model, "error",
+                          network_error == net::OK
+                              ? "모델 공급자가 요청을 거부했습니다."
+                              : "모델 공급자 네트워크 요청에 실패했습니다.");
       result.Set("http_status", http_status);
       Reply(pending.callback_id, std::move(result));
       return;
     }
-    auto result = ParseInferenceResponse(pending.provider, pending.model, *body);
+    auto result =
+        ParseInferenceResponse(pending.provider, pending.model, *body);
     if (!result) {
       Reply(pending.callback_id,
             InferenceResult(pending.provider, pending.model, "error",
@@ -1367,17 +1813,17 @@ class MewebAgentWorkspaceHandler : public content::WebUIMessageHandler {
       return;
     }
     AllowJavascript();
-    CallJavascriptFunction(
-        "mewebAgentWorkspaceLoadState",
-        base::Value(
-            profile_->GetPrefs()->GetString(kMewebAgentWorkspaceStatePref)));
+    CallJavascriptFunction("mewebAgentWorkspaceLoadState",
+                           base::Value(profile_->GetPrefs()->GetString(
+                               kMewebAgentWorkspaceStatePref)));
   }
 
   raw_ptr<Profile> profile_;
-  std::map<std::string, MemoryCredential> credentials_;
   std::unique_ptr<network::SimpleURLLoader> auth_loader_;
   std::unique_ptr<network::SimpleURLLoader> inference_loader_;
   std::optional<PendingInference> pending_inference_;
+  int observation_sequence_ = 0;
+  std::optional<PendingObservation> pending_observation_;
   base::WeakPtrFactory<MewebAgentWorkspaceHandler> weak_ptr_factory_{this};
 };
 
@@ -1886,11 +2332,10 @@ content::WebUIDataSource* CreateAndAddNewTabPageUiHtmlSource(
       "searchboxShowComposeEntrypoint",
       (aim_eligible || ntp_composebox::IsNtpComposeboxEnabled(profile)));
 
-  source->AddBoolean(
-      "ntpRealboxDynamicAiModeButton",
-      ntp_realbox::IsNtpRealboxNextEnabled(profile) &&
-          base::FeatureList::IsEnabled(
-              ntp_realbox::kNtpRealboxDynamicAiModeButton));
+  source->AddBoolean("ntpRealboxDynamicAiModeButton",
+                     ntp_realbox::IsNtpRealboxNextEnabled(profile) &&
+                         base::FeatureList::IsEnabled(
+                             ntp_realbox::kNtpRealboxDynamicAiModeButton));
 
   if (ntp_realbox::IsNtpRealboxNextEnabled(profile)) {
     if (base::FeatureList::IsEnabled(
@@ -1945,7 +2390,6 @@ content::WebUIDataSource* CreateAndAddNewTabPageUiHtmlSource(
                      ntp_composebox::kShowComposeboxTypedSuggest.Get());
   source->AddBoolean("composeboxShowImageSuggest",
                      ntp_composebox::kShowComposeboxImageSuggestions.Get());
-
 
   source->AddBoolean("composeboxSmartComposeEnabled",
                      ntp_composebox::kShowSmartCompose.Get());
@@ -2470,9 +2914,9 @@ void NewTabPageUI::BindInterface(
   auto* aim_service = AimEligibilityServiceFactory::GetForProfile(profile_);
   bool aim_eligible = aim_service && aim_service->IsAimEligible();
 
-  if (!aim_eligible &&
-      !ntp_composebox::IsNtpComposeboxEnabled(profile_) &&
-      !SearchboxHandler::GetVoiceSearchCoherenceAnySearchboxExperimentEnabled()) {
+  if (!aim_eligible && !ntp_composebox::IsNtpComposeboxEnabled(profile_) &&
+      !SearchboxHandler::
+          GetVoiceSearchCoherenceAnySearchboxExperimentEnabled()) {
     return;
   }
   if (composebox_page_factory_receiver_.is_bound()) {

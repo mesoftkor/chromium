@@ -461,6 +461,19 @@ void BrowserActions::InitializeSidePanelActions() {
                                                         : kReadingListOldIcon,
                       kActionSidePanelShowReadingList, bwi, true)
           .Build());
+  root_action_item_->AddChild(
+      actions::ActionItem::Builder(
+          CreateToggleSidePanelActionCallback(
+              SidePanelEntryKey(SidePanelEntryId::kAssistant), bwi))
+          .SetActionId(kActionSidePanelShowAssistant)
+          .SetText(u"MEWEB AI Agent")
+          .SetTooltipText(u"MEWEB AI Agent 열기")
+          .SetImage(ui::ImageModel::FromVectorIcon(vector_icons::kChatIcon,
+                                                   ui::kColorIcon))
+          .SetProperty(actions::kActionItemPinnableKey,
+                       std::underlying_type_t<actions::ActionPinnableState>(
+                           actions::ActionPinnableState::kPinnable))
+          .Build());
   if (TabsFromOtherDevicesSidePanelCoordinator::IsSupported(profile)) {
     root_action_item_->AddChild(
         SidePanelAction(SidePanelEntryId::kTabsFromOtherDevices,
@@ -3231,7 +3244,6 @@ void BrowserActions::InitializeToolbarAndMiscActions() {
           .SetActionId(kActionGroupUngroupedTabs)
           .Build());
 
-
   root_action_item_->AddChild(
       actions::ActionItem::Builder(
           base::BindRepeating(
@@ -4170,9 +4182,8 @@ void BrowserActions::InitializeToolbarAndMiscActions() {
               [](BrowserWindowInterface* bwi, actions::ActionItem* item,
                  actions::ActionInvocationContext context) {
                 PrefService* pref_service = bwi->GetProfile()->GetPrefs();
-                const char* pref_name =
-                    media_router::prefs::
-                        kMediaRouterShowCastSessionsStartedByOtherDevices;
+                const char* pref_name = media_router::prefs::
+                    kMediaRouterShowCastSessionsStartedByOtherDevices;
                 pref_service->SetBoolean(pref_name,
                                          !pref_service->GetBoolean(pref_name));
               },
