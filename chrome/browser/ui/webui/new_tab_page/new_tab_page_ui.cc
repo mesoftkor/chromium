@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "base/barrier_callback.h"
 #include "base/base64.h"
 #include "base/command_line.h"
 #include "base/environment.h"
@@ -26,6 +27,7 @@
 #include "base/memory/weak_ptr.h"
 #include "base/metrics/histogram_functions.h"
 #include "base/notreached.h"
+#include "base/numerics/safe_conversions.h"
 #include "base/strings/strcat.h"
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/string_split.h"
@@ -136,6 +138,7 @@
 #include "components/user_education/common/user_education_features.h"
 #include "content/public/browser/navigation_handle.h"
 #include "content/public/browser/render_frame_host.h"
+#include "content/public/browser/storage_partition.h"
 #include "content/public/browser/url_data_source.h"
 #include "content/public/browser/web_ui.h"
 #include "content/public/browser/web_ui_data_source.h"
@@ -147,6 +150,9 @@
 #include "mojo/public/cpp/bindings/callback_helpers.h"
 #include "net/base/net_errors.h"
 #include "net/base/url_util.h"
+#include "net/cookies/canonical_cookie.h"
+#include "net/cookies/cookie_options.h"
+#include "net/cookies/cookie_partition_key_collection.h"
 #include "net/http/http_request_headers.h"
 #include "net/http/http_response_headers.h"
 #include "net/traffic_annotation/network_traffic_annotation.h"
@@ -155,6 +161,7 @@
 #include "services/network/public/cpp/simple_url_loader.h"
 #include "services/network/public/cpp/simple_url_loader_stream_consumer.h"
 #include "services/network/public/mojom/content_security_policy.mojom.h"
+#include "services/network/public/mojom/cookie_manager.mojom.h"
 #include "services/network/public/mojom/url_response_head.mojom.h"
 #include "skia/ext/skia_utils_base.h"
 #include "third_party/blink/public/common/associated_interfaces/associated_interface_provider.h"
@@ -295,6 +302,16 @@ class MewebAgentWorkspaceHandler
         base::BindRepeating(&MewebAgentWorkspaceHandler::HandleLoadState,
                             base::Unretained(this)));
     web_ui()->RegisterMessageCallback(
+        "mewebSiteAccountStatus",
+        base::BindRepeating(
+            &MewebAgentWorkspaceHandler::HandleSiteAccountStatus,
+            base::Unretained(this)));
+    web_ui()->RegisterMessageCallback(
+        "mewebSiteAccountDisconnect",
+        base::BindRepeating(
+            &MewebAgentWorkspaceHandler::HandleSiteAccountDisconnect,
+            base::Unretained(this)));
+    web_ui()->RegisterMessageCallback(
         "mewebModelAuthStatus",
         base::BindRepeating(&MewebAgentWorkspaceHandler::HandleModelAuthStatus,
                             base::Unretained(this)));
@@ -379,6 +396,141 @@ class MewebAgentWorkspaceHandler
 
   static bool CanPersistCredential(std::string_view method) {
     return method != "none" && method != "oauth_wif";
+  }
+
+  static GURL SiteAccountUrl(std::string_view account) {
+    if (account == "naver") {
+      return GURL("https://nid.naver.com/");
+    }
+    if (account == "google") {
+      return GURL("https://accounts.google.com/");
+    }
+    return GURL();
+  }
+
+  static std::vector<std::string> SiteAccountCookieNames(
+      std::string_view account) {
+    if (account == "naver") {
+      return {"NID_AUT", "NID_SES"};
+    }
+    if (account == "google") {
+      return {"SID",     "HSID",           "SSID",          "APISID",
+              "SAPISID", "__Secure-1PSID", "__Secure-3PSID"};
+    }
+    return {};
+  }
+
+  static std::string SiteAccountCookieDomain(std::string_view account) {
+    if (account == "naver") {
+      return "naver.com";
+    }
+    if (account == "google") {
+      return "google.com";
+    }
+    return std::string();
+  }
+
+  base::DictValue SiteAccountResult(std::string_view account,
+                                    bool connected,
+                                    std::string_view status,
+                                    std::string_view message,
+                                    uint32_t deleted_cookie_count = 0) const {
+    base::DictValue result;
+    result.Set("account", account);
+    result.Set("connected", connected);
+    result.Set("status", status);
+    result.Set("message", message);
+    result.Set("storage", "chromium_profile_cookie_session");
+    result.Set("secret_exposed_to_webui", false);
+    result.Set("deleted_cookie_count",
+               base::checked_cast<int>(deleted_cookie_count));
+    return result;
+  }
+
+  void HandleSiteAccountStatus(const base::ListValue& args) {
+    if (args.size() != 2 || !args[0].is_string() || !args[1].is_string()) {
+      return;
+    }
+    const std::string& account = args[1].GetString();
+    const GURL url = SiteAccountUrl(account);
+    const std::vector<std::string> cookie_names =
+        SiteAccountCookieNames(account);
+    if (!url.is_valid() || cookie_names.empty()) {
+      Reply(args[0], SiteAccountResult(account, false, "error",
+                                       "지원하지 않는 웹 계정입니다."));
+      return;
+    }
+    profile_->GetDefaultStoragePartition()
+        ->GetCookieManagerForBrowserProcess()
+        ->GetCookieList(
+            url, net::CookieOptions::MakeAllInclusive(),
+            net::CookiePartitionKeyCollection::ContainsAll(),
+            base::BindOnce(
+                &MewebAgentWorkspaceHandler::OnSiteAccountCookiesRead,
+                weak_ptr_factory_.GetWeakPtr(), args[0].Clone(), account,
+                cookie_names));
+  }
+
+  void OnSiteAccountCookiesRead(base::Value callback_id,
+                                std::string account,
+                                std::vector<std::string> cookie_names,
+                                const net::CookieAccessResultList& cookies,
+                                const net::CookieAccessResultList&) {
+    const bool connected = std::ranges::any_of(
+        cookies, [&cookie_names](const net::CookieWithAccessResult& item) {
+          return std::ranges::find(cookie_names, item.cookie.Name()) !=
+                 cookie_names.end();
+        });
+    Reply(callback_id,
+          SiteAccountResult(
+              account, connected, connected ? "connected" : "disconnected",
+              connected ? "현재 Chromium 프로필의 로그인 세션이 연결되어 "
+                          "있습니다."
+                        : "현재 Chromium 프로필에서 로그인 세션을 찾지 "
+                          "못했습니다."));
+  }
+
+  void HandleSiteAccountDisconnect(const base::ListValue& args) {
+    if (args.size() != 2 || !args[0].is_string() || !args[1].is_string()) {
+      return;
+    }
+    const std::string& account = args[1].GetString();
+    const std::vector<std::string> cookie_names =
+        SiteAccountCookieNames(account);
+    const std::string domain = SiteAccountCookieDomain(account);
+    if (cookie_names.empty() || domain.empty()) {
+      Reply(args[0], SiteAccountResult(account, false, "error",
+                                       "지원하지 않는 웹 계정입니다."));
+      return;
+    }
+    auto deleted = base::BarrierCallback<uint32_t>(
+        cookie_names.size(),
+        base::BindOnce(&MewebAgentWorkspaceHandler::OnSiteAccountCookiesDeleted,
+                       weak_ptr_factory_.GetWeakPtr(), args[0].Clone(),
+                       account));
+    network::mojom::CookieManager* cookie_manager =
+        profile_->GetDefaultStoragePartition()
+            ->GetCookieManagerForBrowserProcess();
+    for (const std::string& cookie_name : cookie_names) {
+      auto filter = network::mojom::CookieDeletionFilter::New();
+      filter->cookie_name = cookie_name;
+      filter->including_domains = std::vector<std::string>{domain};
+      cookie_manager->DeleteCookies(std::move(filter), base::BindOnce(deleted));
+    }
+  }
+
+  void OnSiteAccountCookiesDeleted(base::Value callback_id,
+                                   std::string account,
+                                   std::vector<uint32_t> deleted_counts) {
+    uint32_t deleted_cookie_count = 0;
+    for (uint32_t count : deleted_counts) {
+      deleted_cookie_count += count;
+    }
+    Reply(callback_id,
+          SiteAccountResult(account, false, "disconnected",
+                            "현재 Chromium 프로필의 로그인 인증 쿠키를 "
+                            "삭제했습니다.",
+                            deleted_cookie_count));
   }
 
   std::string KeychainNamespace(bool create_if_missing) {

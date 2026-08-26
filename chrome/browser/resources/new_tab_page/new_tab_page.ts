@@ -291,6 +291,26 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       },
     },
   };
+  const SITE_ACCOUNT_DEFINITIONS = {
+    naver: {
+      label: '네이버', icon: 'N', domain: 'naver.com',
+      loginUrl: 'https://nid.naver.com/nidlogin.login?mode=form&redirect_url=%2F',
+    },
+    google: {
+      label: 'Google', icon: 'G', domain: 'google.com',
+      loginUrl: 'https://accounts.google.com/',
+    },
+  };
+  const MODEL_ACCOUNT_DEFINITIONS = [
+    {provider: 'openai', label: 'OpenAI', profile: 'openai/gpt-4o-mini'},
+    {provider: 'anthropic', label: 'Anthropic', profile: 'anthropic/claude-sonnet-4-6'},
+    {provider: 'gemini', label: 'Gemini', profile: 'gemini/gemini-3.6-flash'},
+    {provider: 'ollama', label: 'Ollama', profile: 'ollama/gpt-oss-120b-cloud'},
+    {provider: 'openrouter', label: 'OpenRouter', profile: 'openrouter/auto'},
+  ].map(definition => ({
+    ...definition,
+    methods: Object.keys(MODEL_AUTHENTICATION[definition.provider].methods),
+  }));
   const MODEL_TOOL_CHOICES = ['required', 'auto', 'none'];
   const MODEL_SELECTOR_PROFILES = ['naver-desktop-v1', 'naver-mobile-v1'];
   const MODEL_FAIL_POLICIES = [
@@ -539,6 +559,18 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     credentialPersisted: false, keychainAvailable: true,
     message: '연결 상태를 확인하지 않았습니다.',
   };
+  let siteAccountConnections = Object.fromEntries(
+      Object.keys(SITE_ACCOUNT_DEFINITIONS).map(account => [account, {
+        account, status: 'unknown', connected: false,
+        message: '로그인 상태를 확인하지 않았습니다.',
+      }]));
+  let modelAccountConnections = Object.fromEntries(
+      MODEL_ACCOUNT_DEFINITIONS.map(definition => [definition.provider, {
+        provider: definition.provider, status: 'unknown', connected: false,
+        message: '모델 연결 상태를 확인하지 않았습니다.',
+      }]));
+  let accountConnectionsRefreshing = false;
+  let accountConnectionsRefreshPromise = null;
   let modelInference = {
     key: '', status: 'idle', completed: false,
     message: '아직 모델 응답 시험을 실행하지 않았습니다.',
@@ -674,7 +706,7 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     const crumbs = {
       start: '<b>시작 화면</b> · 검색, 바로가기와 진행 중인 작업',
       work: `<b>${esc(state.task.name)}</b> · 승인 기반 에이전트 워크스페이스`,
-      settings: `<b>환경설정</b> · ${esc({appearance:'모양', search:'검색엔진', startup:'시작 화면', agent:'에이전트', models:'AI 모델', privacy:'개인정보 보호', downloads:'다운로드', updates:'업데이트·복구'}[settingsSection])}`,
+      settings: `<b>환경설정</b> · ${esc({appearance:'모양', search:'검색엔진', startup:'시작 화면', agent:'에이전트', accounts:'계정·연결', models:'AI 모델', privacy:'개인정보 보호', downloads:'다운로드', updates:'업데이트·복구'}[settingsSection])}`,
     };
     setHtml($('#crumb'), crumbs[currentView]);
     $('#auditPanel').hidden = !auditOpen || currentView !== 'work';
@@ -751,6 +783,31 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
       setHtml(content, `<h1>검색엔진</h1><p class="lede">시작 화면 검색에 사용할 서비스를 선택합니다.</p><section class="settings-card"><h2>기본 검색엔진</h2>${ENGINES.map(item => row(`<span style="color:${item.color};font-weight:700">●</span> ${esc(item.name)}`, item.host, item.id === state.start.engine ? '<span class="value">기본</span>' : `<button class="btn" data-engine="${item.id}">기본으로 설정</button>`)).join('')}</section>`);
     } else if (settingsSection === 'startup') {
       setHtml(content, `<h1>시작 화면</h1><p class="lede">새 탭에서 보여줄 정보를 선택합니다.</p><section class="settings-card"><h2>구성</h2>${row('바로가기 표시', '직접 추가하고 삭제한 링크가 프로필에 저장됩니다.', `<button class="toggle" id="showLinksToggle" aria-pressed="${state.start.showLinks}"></button>`)}${row('진행 중인 작업 표시', '', `<button class="toggle" id="showTasksToggle" aria-pressed="${state.start.showTasks}"></button>`)}${row('저장된 바로가기', '', `<span class="value">${state.start.links.length}개</span>`)}</section>`);
+    } else if (settingsSection === 'accounts') {
+      const siteCards = Object.entries(SITE_ACCOUNT_DEFINITIONS).map(
+          ([account, definition]) => {
+            const status = siteAccountConnections[account];
+            const statusLabel = status.connected ? '연결됨' :
+                status.status === 'checking' ? '확인 중' : '연결 안 됨';
+            const statusClass = status.connected ? 'run' :
+                status.status === 'checking' ? 'gate' : 'done';
+            return `<div class="account-card" data-site-account="${account}" data-status="${esc(status.status)}"><div class="account-head"><span class="account-icon">${esc(definition.icon)}</span><span class="account-name"><b>${esc(definition.label)}</b><small>${esc(definition.domain)} · Chromium 프로필 세션</small></span><span class="chip ${statusClass}">${statusLabel}</span></div><p class="account-message">${esc(status.message)}</p><div class="account-actions"><button class="btn primary" data-open-site-account="${account}">${status.connected ? '다른 계정으로 로그인' : '공식 로그인 열기'}</button><button class="btn" data-check-site-account="${account}">상태 확인</button><button class="btn danger" data-disconnect-site-account="${account}" ${status.connected ? '' : 'disabled'}>세션 연결 해제</button></div></div>`;
+          }).join('');
+      const modelCards = MODEL_ACCOUNT_DEFINITIONS.map(definition => {
+        const status = modelAccountConnections[definition.provider];
+        const statusLabel = status.connected ? '연결됨' :
+            status.status === 'checking' ? '확인 중' : '연결 안 됨';
+        const statusClass = status.connected ? 'run' :
+            status.status === 'checking' ? 'gate' : 'done';
+        const storage = status.connected ?
+            status.credentialPersisted ? 'macOS 키체인' : '현재 앱 메모리' :
+            '자격 증명 없음';
+        return `<div class="account-card" data-model-account="${esc(definition.provider)}" data-status="${esc(status.status)}"><div class="account-head"><span class="account-icon">${esc(definition.label.slice(0, 1))}</span><span class="account-name"><b>${esc(definition.label)}</b><small>${esc(storage)}${status.methodLabel ? ` · ${esc(status.methodLabel)}` : ''}</small></span><span class="chip ${statusClass}">${statusLabel}</span></div><p class="account-message">${esc(status.message)}</p><div class="account-actions"><button class="btn primary" data-open-model-account="${esc(definition.provider)}">모델 설정</button><button class="btn danger" data-disconnect-model-account="${esc(definition.provider)}" ${status.connected ? '' : 'disabled'}>모든 모델 연결 해제</button></div></div>`;
+      }).join('');
+      setHtml(content, `<h1>계정·연결</h1><p class="lede">웹 로그인과 AI 모델 연결을 한 화면에서 확인하고 해제합니다.</p>
+        <section class="settings-card"><h2>웹 로그인</h2><div class="setting-row"><div class="note"><b>비밀번호와 쿠키 값은 이 화면이나 Agent에 전달하지 않습니다.</b><br>로그인은 공식 사이트에서 사용자가 직접 완료하며, 상태는 현재 Chromium 프로필의 인증 쿠키 존재 여부만 확인합니다.</div></div><div class="setting-row"><div class="account-grid">${siteCards}</div></div></section>
+        <section class="settings-card"><h2>AI 모델 공급자</h2><div class="setting-row"><div class="note">기본값은 앱 메모리 전용입니다. 사용자가 저장을 선택한 장기 자격 증명만 macOS 키체인에서 복원합니다.</div></div><div class="setting-row"><div class="account-grid">${modelCards}</div></div></section>
+        <div class="setting-row"><div class="setting-control"><button class="btn primary" id="refreshAccountConnectionsButton" ${accountConnectionsRefreshing ? 'disabled' : ''}>전체 상태 새로고침</button></div><div class="validation" id="accountConnectionsStatus">${accountConnectionsRefreshing ? '계정 연결 상태를 확인하고 있습니다.' : '계정 비밀값은 Preferences와 localStorage에 저장하지 않습니다.'}</div></div>`);
     } else if (settingsSection === 'models') {
       const selectedProfile = modelProfile();
       const endpointEditable = selectedProfile.provider === 'ollama' &&
@@ -1203,6 +1260,148 @@ export {FooHandlerRemote} from './foo.mojom-webui.js';
     } catch (_error) {
       return null;
     }
+  }
+
+  async function checkSiteAccount(account, shouldRender = true) {
+    if (!SITE_ACCOUNT_DEFINITIONS[account]) return null;
+    siteAccountConnections[account] = {
+      account, status: 'checking', connected: false,
+      message: '현재 Chromium 프로필의 로그인 세션을 확인하고 있습니다.',
+    };
+    if (shouldRender && settingsSection === 'accounts') renderSettings();
+    try {
+      const result = await sendModelAuthRequest(
+          'mewebSiteAccountStatus', account);
+      siteAccountConnections[account] = {
+        account,
+        status: result?.status || 'error',
+        connected: result?.connected === true,
+        message: result?.message || '로그인 상태 결과가 없습니다.',
+      };
+      if (shouldRender && settingsSection === 'accounts') renderSettings();
+      return result;
+    } catch (_error) {
+      siteAccountConnections[account] = {
+        account, status: 'error', connected: false,
+        message: '네이티브 세션 브로커의 상태를 확인하지 못했습니다.',
+      };
+      if (shouldRender && settingsSection === 'accounts') renderSettings();
+      return null;
+    }
+  }
+
+  async function checkModelAccount(definition) {
+    const results = await Promise.all(definition.methods.map(method =>
+      sendModelAuthRequest(
+          'mewebModelAuthStatus', definition.provider, method)));
+    const connected = results.find(result => result?.connected === true);
+    if (!connected) {
+      modelAccountConnections[definition.provider] = {
+        provider: definition.provider, status: 'disconnected', connected: false,
+        message: '연결된 인증 방식이 없습니다.',
+      };
+      return modelAccountConnections[definition.provider];
+    }
+    const methodDefinition =
+        MODEL_AUTHENTICATION[definition.provider].methods[connected.method];
+    modelAccountConnections[definition.provider] = {
+      provider: definition.provider,
+      status: connected.status || 'connected',
+      connected: true,
+      credentialPersisted:
+          connected.credential_persisted_by_meweb === true,
+      method: connected.method,
+      methodLabel: methodDefinition?.label || connected.method,
+      message: connected.message || '모델 공급자에 연결되어 있습니다.',
+    };
+    return modelAccountConnections[definition.provider];
+  }
+
+  async function refreshAccountConnections() {
+    if (accountConnectionsRefreshPromise) {
+      return accountConnectionsRefreshPromise;
+    }
+    accountConnectionsRefreshPromise = (async () => {
+      accountConnectionsRefreshing = true;
+      for (const account of Object.keys(SITE_ACCOUNT_DEFINITIONS)) {
+        siteAccountConnections[account] = {
+          account, status: 'checking', connected: false,
+          message: '현재 Chromium 프로필의 로그인 세션을 확인하고 있습니다.',
+        };
+      }
+      for (const definition of MODEL_ACCOUNT_DEFINITIONS) {
+        modelAccountConnections[definition.provider] = {
+          provider: definition.provider, status: 'checking', connected: false,
+          message: '모델 인증 연결을 확인하고 있습니다.',
+        };
+      }
+      if (settingsSection === 'accounts') renderSettings();
+      await Promise.all([
+        ...Object.keys(SITE_ACCOUNT_DEFINITIONS).map(account =>
+          checkSiteAccount(account, false)),
+        ...MODEL_ACCOUNT_DEFINITIONS.map(definition =>
+          checkModelAccount(definition)),
+      ]);
+      accountConnectionsRefreshing = false;
+      if (settingsSection === 'accounts') renderSettings();
+      return true;
+    })();
+    try {
+      return await accountConnectionsRefreshPromise;
+    } finally {
+      accountConnectionsRefreshPromise = null;
+    }
+  }
+
+  function openSiteAccountLogin(account) {
+    const definition = SITE_ACCOUNT_DEFINITIONS[account];
+    if (!definition) return false;
+    const opened = openUrl(definition.loginUrl);
+    if (opened) {
+      record(`${definition.label} 공식 로그인 화면을 열었습니다.`);
+      toast('로그인을 직접 완료한 뒤 계정 상태를 새로고침하세요.');
+    }
+    return opened;
+  }
+
+  async function disconnectSiteAccount(account) {
+    const definition = SITE_ACCOUNT_DEFINITIONS[account];
+    if (!definition) return null;
+    siteAccountConnections[account] = {
+      account, status: 'disconnecting', connected: true,
+      message: '현재 Chromium 프로필의 인증 쿠키를 삭제하고 있습니다.',
+    };
+    if (settingsSection === 'accounts') renderSettings();
+    const result = await sendModelAuthRequest(
+        'mewebSiteAccountDisconnect', account);
+    siteAccountConnections[account] = {
+      account,
+      status: result?.status || 'error',
+      connected: result?.connected === true,
+      message: result?.message || '세션 연결 해제 결과가 없습니다.',
+    };
+    record(`${definition.label} 웹 로그인 세션 연결을 해제했습니다.`);
+    if (settingsSection === 'accounts') renderSettings();
+    toast(`${definition.label} 웹 로그인 세션을 연결 해제했습니다.`);
+    return result;
+  }
+
+  async function disconnectModelAccount(provider) {
+    const definition = MODEL_ACCOUNT_DEFINITIONS.find(
+        item => item.provider === provider);
+    if (!definition) return null;
+    modelAccountConnections[provider] = {
+      provider, status: 'disconnecting', connected: true,
+      message: '모든 인증 방식의 연결과 저장 정보를 삭제하고 있습니다.',
+    };
+    if (settingsSection === 'accounts') renderSettings();
+    const results = await Promise.all(definition.methods.map(method =>
+      sendModelAuthRequest('mewebModelAuthDisconnect', provider, method)));
+    await checkModelAccount(definition);
+    record(`${definition.label} 모델 공급자의 모든 연결과 저장 정보를 삭제했습니다.`);
+    if (settingsSection === 'accounts') renderSettings();
+    toast(`${definition.label} 모델 연결을 모두 해제했습니다.`);
+    return results;
   }
 
   async function generateModelResponse(promptOverride, tools = []) {
@@ -1679,7 +1878,33 @@ SmartEditor ONE 프레임을 발견하면 일반 DOM 입력 대신 inspect_edito
       return;
     }
     if (button.dataset.viewTarget) { switchView(button.dataset.viewTarget); return; }
-    if (button.dataset.settingsTarget) { settingsSection = button.dataset.settingsTarget; renderSettings(); renderNavigation(); return; }
+    if (button.dataset.settingsTarget) {
+      settingsSection = button.dataset.settingsTarget;
+      renderSettings(); renderNavigation();
+      if (settingsSection === 'accounts') refreshAccountConnections();
+      return;
+    }
+    if (button.dataset.openSiteAccount) {
+      openSiteAccountLogin(button.dataset.openSiteAccount); return;
+    }
+    if (button.dataset.checkSiteAccount) {
+      checkSiteAccount(button.dataset.checkSiteAccount); return;
+    }
+    if (button.dataset.disconnectSiteAccount) {
+      disconnectSiteAccount(button.dataset.disconnectSiteAccount); return;
+    }
+    if (button.dataset.openModelAccount) {
+      const definition = MODEL_ACCOUNT_DEFINITIONS.find(
+          item => item.provider === button.dataset.openModelAccount);
+      if (definition) {
+        settingsSection = 'models';
+        selectModelProfile(definition.profile);
+      }
+      return;
+    }
+    if (button.dataset.disconnectModelAccount) {
+      disconnectModelAccount(button.dataset.disconnectModelAccount); return;
+    }
     if (button.dataset.modelProfile) { selectModelProfile(button.dataset.modelProfile); return; }
     if (button.dataset.engine) { setEngine(button.dataset.engine); return; }
     if (button.dataset.startAction) { startAction(button.dataset.startAction); return; }
@@ -1748,6 +1973,7 @@ SmartEditor ONE 프레임을 발견하면 일반 DOM 입력 대신 inspect_edito
       case 'connectModelProviderButton': connectModelProvider(); break;
       case 'checkModelProviderButton': checkModelProviderConnection(); break;
       case 'disconnectModelProviderButton': disconnectModelProvider(); break;
+      case 'refreshAccountConnectionsButton': refreshAccountConnections(); break;
       case 'testModelResponseButton': generateModelResponse(); break;
       case 'cancelModelResponseButton': cancelModelResponse(); break;
       case 'openChromeSettingsButton': window.location.assign('chrome://settings/'); break;
@@ -1808,6 +2034,19 @@ SmartEditor ONE 프레임을 발견하면 일반 DOM 입력 대신 inspect_edito
     setAutonomy: value => { state.persona.autonomy = value; state.task.decisions = {}; save(); renderAll(); },
     getModelRuntimeConfig: () => JSON.parse(JSON.stringify(effectiveModelRuntime())),
     getModelAuthStatus: () => JSON.parse(JSON.stringify(modelAuthConnection)),
+    getAccountConnections: () => JSON.parse(JSON.stringify({
+      sites: siteAccountConnections,
+      models: modelAccountConnections,
+      refreshing: accountConnectionsRefreshing,
+    })),
+    getAccountDefinitions: () => JSON.parse(JSON.stringify({
+      sites: SITE_ACCOUNT_DEFINITIONS,
+      models: MODEL_ACCOUNT_DEFINITIONS,
+    })),
+    refreshAccountConnections: () => refreshAccountConnections(),
+    checkSiteAccount: account => checkSiteAccount(account),
+    disconnectSiteAccount: account => disconnectSiteAccount(account),
+    disconnectModelAccount: provider => disconnectModelAccount(provider),
     connectModelProvider: (credential, persistInKeychain = false) => {
       const input = $('#modelCredentialInput');
       if (input) input.value = credential || '';
